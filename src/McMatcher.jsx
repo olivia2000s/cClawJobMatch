@@ -479,7 +479,19 @@ function TaskModal({ task, profile, isApplied, onApply, onClose }) {
               </div>
               <div className="tm-sec"><h4>How you get paid</h4><p>{task.pay} $MCLAW is locked in escrow the moment you're hired. A validator confirms your result, then funds release straight to your wallet — usually within minutes.</p></div>
               <button className={`tc-apply lg ${isApplied ? "done" : ""}`} disabled={isApplied} onClick={() => onApply(task.id)}>{isApplied ? <><Check size={15} /> Applied</> : "Apply via your agent"}</button>
-              {isApplied && task.source === "mcclaw" && <p className="tm-req">Continue on <a href="https://mcclaw.io" target="_blank" rel="noopener" style={{ color: "var(--em)" }}>mcclaw.io</a> → open <b>Tasks</b>, search <b>"{task.title}"</b>, and apply with your wallet.</p>}
+              {isApplied && task.source === "mcclaw" && (
+                <div className="tm-steps">
+                  <h4>Next: finish on McClaw</h4>
+                  <p>Your agent flagged this task. Applying is completed on McClaw, where the on-chain $MCLAW stake is signed by your own wallet.</p>
+                  <a className="tm-steps-link" href="https://mcclaw.io" target="_blank" rel="noopener noreferrer">Open mcclaw.io <ArrowRight size={14} /></a>
+                  <ol className="tm-steps-list">
+                    <li>On <b>mcclaw.io</b>, connect your wallet.</li>
+                    <li>Go to the <b>Tasks</b> section.</li>
+                    <li>Search for <b>“{task.title}”</b>.</li>
+                    <li>Open it and <b>stake $MCLAW to apply</b> — confirm in your wallet.</li>
+                  </ol>
+                </div>
+              )}
             </>
           )}
         </div>
@@ -519,7 +531,7 @@ function TaskCard({ task, profile, applied, onApply, tier }) {
               <span><Clock size={11} />{task.schedule}</span>
             </div>
             {m && m.gated && <div className="tc-gate">Needs reputation {task.minReputation} (you: {profile.reputation})</div>}
-            <button className={`tc-apply ${isApplied ? "done" : ""}`} disabled={isApplied} onClick={(e) => { e.stopPropagation(); onApply(task.id); }}>
+            <button className={`tc-apply ${isApplied ? "done" : ""}`} disabled={isApplied} onClick={(e) => { e.stopPropagation(); onApply(task.id); if (task.source === "mcclaw") setOpen(true); }}>
               {isApplied ? <><Check size={14} /> Applied</> : "Apply via your agent"}
             </button>
           </>
@@ -1358,6 +1370,16 @@ const STYLE = `
 .save-note{ display:inline-flex; align-items:center; gap:7px; font-family:'JetBrains Mono',monospace; font-size:11px; letter-spacing:.5px; color:var(--gold); }
 .sn-dot{ width:7px; height:7px; border-radius:50%; background:var(--gold); box-shadow:0 0 8px var(--gold); animation:savepulse 1.8s ease-in-out infinite; }
 .btn-ghost.connected{ border-color:var(--em); color:var(--em); }
+.tm-steps{ margin-top:18px; background:#0a1a12; border:1px solid var(--line); border-radius:12px; padding:16px 18px; }
+.tm-steps h4{ font-family:'JetBrains Mono',monospace; font-size:11px; letter-spacing:1.5px; text-transform:uppercase; color:var(--em); margin:0 0 9px; }
+.tm-steps > p{ font-size:13.5px; color:var(--mut); margin:0 0 13px; line-height:1.55; }
+.tm-steps-link{ display:inline-flex; align-items:center; gap:7px; background:var(--em); color:#06100b; text-decoration:none; border-radius:22px; padding:10px 17px; font-weight:800; font-size:13.5px; }
+.tm-steps-link:hover{ background:#4ce39a; }
+.tm-steps-list{ counter-reset:step; list-style:none; margin:15px 0 0; padding:0; }
+.tm-steps-list li{ position:relative; padding:0 0 11px 34px; color:#d4e7dd; font-size:14px; line-height:1.5; }
+.tm-steps-list li:last-child{ padding-bottom:0; }
+.tm-steps-list li::before{ counter-increment:step; content:counter(step); position:absolute; left:0; top:-1px; width:23px; height:23px; border-radius:50%; background:var(--surf); border:1px solid var(--em); color:var(--em); font-family:'JetBrains Mono',monospace; font-size:12px; font-weight:700; display:grid; place-items:center; }
+.tm-steps-list b{ color:var(--txt); }
 `;
 
 /* ===================== App ===================== */
@@ -1616,12 +1638,9 @@ export default function McMatcherProduct() {
   const onApply = (id) => {
     const task = tasks.find((t) => t.id === id);
     const isLive = task && task.source === "mcclaw";
-    // Live task → open McClaw right away (synchronously in the click, so the tab
-    // isn't popup-blocked). No profile needed for this redirect.
-    if (isLive) {
-      const w = window.open("https://mcclaw.io", "_blank");
-      if (w) w.opener = null;
-    } else if (!profile) {
+    // Live task → no redirect; the task view shows an in-app "next steps" panel
+    // with the McClaw link + instructions. No profile needed for this.
+    if (!isLive && !profile) {
       setTab("profile");
       return;
     }
