@@ -51,7 +51,7 @@ function normalizeLiveTask(t) {
     location: "Remote", remote: true, skills: [],
     minYears: 0, minReputation: 0, schedule: "async", timeCommitmentHours: 1,
     pay: Math.round(weiToMclaw(t.escrowAmount ?? t.escrow_amount ?? 0) * 100) / 100,
-    posted: "new", source: "mcclaw",
+    posted: "new", source: "mcclaw", mcStatus: status,
     img: guessImg((t.title || "") + " " + (t.description || t.desc || "")),
   };
 }
@@ -721,8 +721,8 @@ function Applied({ tasks, applied, profile, jobStatus, onApply }) {
   const [openId, setOpenId] = useState(null);
   const list = tasks.filter((t) => applied.includes(t.id));
   if (!list.length) return <div className="empty">No applications yet. Apply from <b>Suggested</b> or <b>All available</b>, and your agent negotiates on your behalf.</div>;
-  const statusOf = (id) => (jobStatus && jobStatus[id]) ? "hired" : "reviewing";
-  const hired = list.filter((t) => statusOf(t.id) === "hired").length;
+  const stOf = (t) => JOB_STATUS[jobKeyFor(t, jobStatus)];
+  const hired = list.filter((t) => ["in_progress", "submitted", "approved", "paid"].includes(jobKeyFor(t, jobStatus))).length;
   const openTask = tasks.find((t) => t.id === openId);
   return (
     <div className="db">
@@ -733,13 +733,13 @@ function Applied({ tasks, applied, profile, jobStatus, onApply }) {
       </div>
       <div className="db-table">
         <div className="db-th"><span>Task</span><span>Agent</span><span>Pay</span><span>Status</span><span>When</span></div>
-        {list.map((t) => { const s = APP_ST[statusOf(t.id)]; return (
+        {list.map((t) => { const s = stOf(t); return (
           <div className="db-tr" key={t.id} role="button" tabIndex={0} onClick={() => setOpenId(t.id)} onKeyDown={(e) => { if (e.key === "Enter") setOpenId(t.id); }}>
             <span className="db-task">{t.title}</span>
             <span className="db-mut">{t.agent}</span>
             <span className="db-pay">{t.pay} $MCLAW</span>
             <span className="db-st"><i className="db-dot" style={{ background: s.c }} />{s.label}</span>
-            <span className="db-mut">{t.posted} ago</span>
+            <span className="db-mut">{t.posted === "new" ? "live" : `${t.posted} ago`}</span>
           </div>); })}
       </div>
       {openTask && <TaskModal task={openTask} profile={profile} isApplied={true} onApply={() => {}} onClose={() => setOpenId(null)} />}
@@ -821,23 +821,35 @@ function CategoryPicker({ selected, onToggle, wants, onWants }) {
   );
 }
 const JOB_STATUS = {
+  open: { label: "Open · awaiting hire", c: "#9bd0ff", pct: 25, next: null, action: null },
   in_progress: { label: "In progress", c: "#9bd0ff", pct: 55, next: "submitted", action: "Submit work" },
-  submitted: { label: "Awaiting validation", c: "#ffd27a", pct: 82, next: "paid", action: "Mark validated" },
-  paid: { label: "Paid", c: "#2fd286", pct: 100, next: null, action: null },
+  submitted: { label: "Submitted · awaiting validation", c: "#ffd27a", pct: 82, next: "paid", action: "Mark validated" },
+  approved: { label: "Approved", c: "#2fd286", pct: 95, next: null, action: null },
+  paid: { label: "Released · paid", c: "#2fd286", pct: 100, next: null, action: null },
+  rejected: { label: "Rejected", c: "#ff8a72", pct: 100, next: null, action: null },
+  disputed: { label: "Disputed", c: "#ffd27a", pct: 80, next: null, action: null },
+  closed: { label: "Closed", c: "#8fae9f", pct: 100, next: null, action: null },
 };
+// Map McClaw's on-chain task lifecycle onto the app's status display.
+const MC_TO_JOB = { new: "open", funded: "open", active: "in_progress", submitted: "submitted", validating: "submitted", approved: "approved", released: "paid", rejected: "rejected", disputed: "disputed", expired: "closed", removed: "closed", cancelled: "closed" };
+function jobKeyFor(task, jobStatus) {
+  if (!task) return "in_progress";
+  if (task.source === "mcclaw") return MC_TO_JOB[String(task.mcStatus || "").toLowerCase()] || "open";
+  return (jobStatus && jobStatus[task.id]) || "in_progress";
+}
 function WorkingOn({ tasks, applied, jobStatus, onAdvance }) {
   const jobs = applied.map((id) => tasks.find((t) => t.id === id)).filter(Boolean);
   if (!jobs.length) return <div className="empty">Nothing in progress yet. When you take on a task it shows up here with its status, escrow, and next step.</div>;
   return (
     <div className="jobs">
       {jobs.map((t) => {
-        const key = jobStatus[t.id] || "in_progress"; const st = JOB_STATUS[key];
+        const isLive = t.source === "mcclaw"; const st = JOB_STATUS[jobKeyFor(t, jobStatus)];
         const where = t.remote ? "Remote" : modeOf(t) === "hybrid" ? `Hybrid · ${t.location}` : t.location;
         return (
           <div className="job" key={t.id}>
             <div className="job-top">
               <div><h3 className="job-title">{t.title}</h3>
-                <div className="job-agent"><ShieldCheck size={12} color="#2fd286" /> {t.agent} · {TASK_CAT[t.id]}</div></div>
+                <div className="job-agent"><ShieldCheck size={12} color="#2fd286" /> {t.agent}{TASK_CAT[t.id] ? ` · ${TASK_CAT[t.id]}` : ""}</div></div>
               <span className="job-status" style={{ color: st.c, borderColor: st.c }}>{st.label}</span>
             </div>
             <div className="job-bar"><span style={{ width: `${st.pct}%`, background: st.c }} /></div>
@@ -845,10 +857,14 @@ function WorkingOn({ tasks, applied, jobStatus, onAdvance }) {
               <span><Coins size={12} />{t.pay} $MCLAW in escrow</span>
               <span>{t.remote ? <Wifi size={12} /> : modeOf(t) === "hybrid" ? <Shuffle size={12} /> : <MapPin size={12} />}{where}</span>
               <span><Clock size={12} />~{t.timeCommitmentHours}h</span>
-              <span><Briefcase size={12} />Hired {t.posted} ago</span>
+              <span><Briefcase size={12} />{isLive ? "via McClaw" : `Hired ${t.posted} ago`}</span>
             </div>
             <div className="job-actions">
-              {st.next ? <button className="job-go" onClick={() => onAdvance(t.id, st.next)}>{st.action}</button> : <span className="job-paid"><Check size={14} /> Funds released to your wallet</span>}
+              {isLive
+                ? <span className="job-paid"><ShieldCheck size={14} /> Status synced from McClaw</span>
+                : st.next
+                  ? <button className="job-go" onClick={() => onAdvance(t.id, st.next)}>{st.action}</button>
+                  : <span className="job-paid"><Check size={14} /> Funds released to your wallet</span>}
               <button className="job-msg"><MessageCircle size={14} /> Message {t.agent}</button>
             </div>
           </div>
@@ -1648,7 +1664,7 @@ export default function McMatcherProduct() {
     setJobStatus((s) => (s[id] ? s : { ...s, [id]: "in_progress" }));
   };
   const advance = (id, next) => setJobStatus((s) => ({ ...s, [id]: next }));
-  const activeCount = applied.filter((id) => (jobStatus[id] || "in_progress") !== "paid").length;
+  const activeCount = applied.filter((id) => !["paid", "closed", "rejected", "approved"].includes(jobKeyFor(tasks.find((x) => x.id === id), jobStatus))).length;
   const enter = (t) => { setTab(t); setScreen("app"); };
   const finishQuiz = (p) => { setProfile(p); enter("suggested"); };
 
