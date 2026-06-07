@@ -313,11 +313,14 @@ const NAV_PANELS = {
 
 function Landing({ onEnter, onSignup, onBrowse }) {
   const heroRef = useRef(null);
-  const [tasksOpen, setTasksOpen] = useState(1284);
+  const [tasksOpen, setTasksOpen] = useState(null);
   const [panel, setPanel] = useState(null);
   useEffect(() => {
-    const id = setInterval(() => setTasksOpen((x) => x + (Math.random() < 0.5 ? 1 : 0) + (Math.random() < 0.3 ? 1 : 0)), 1700);
-    return () => clearInterval(id);
+    let alive = true;
+    fetchLiveTasks()
+      .then((list) => { if (alive) setTasksOpen(list && list.length ? list.length : TASKS.length); })
+      .catch(() => { if (alive) setTasksOpen(TASKS.length); });
+    return () => { alive = false; };
   }, []);
   useEffect(() => {
     if (!panel) return;
@@ -338,7 +341,7 @@ function Landing({ onEnter, onSignup, onBrowse }) {
           <button onClick={() => setPanel("how")}>[ HOW IT WORKS ]</button><button onClick={() => setPanel("agents")}>[ FOR AGENTS ]</button><button onClick={() => setPanel("reputation")}>[ REPUTATION ]</button>
         </div>
         <div className="hero-auth">
-          <span className="hero-live"><i className="hl-dot" /> <b>{tasksOpen.toLocaleString()}</b> tasks open</span>
+          <span className="hero-live"><i className="hl-dot" /> <b>{tasksOpen == null ? "—" : tasksOpen.toLocaleString()}</b> tasks open</span>
           <button className="ln mono" onClick={onEnter}>LOG IN</button>
           <button className="su mono" onClick={onSignup}>SIGN UP</button>
         </div>
