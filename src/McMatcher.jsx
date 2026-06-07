@@ -6,6 +6,43 @@ import {
   Settings, Bell, Wallet, Lock, Trash2, Eye, Zap
 } from "lucide-react";
 
+/* ===================== live McClaw data ===================== */
+// In dev the Vite proxy forwards /api -> mcclaw.io; in prod vercel.json does the
+// same. The agent X-API-Key comes from VITE_MCCLAW_API_KEY (gitignored .env /
+// Vercel env var). With no key we fall back to the sample TASKS below.
+const MCCLAW_API_BASE = import.meta.env.VITE_MCCLAW_API_BASE || "/api/v1";
+const MCCLAW_KEY = import.meta.env.VITE_MCCLAW_API_KEY || "";
+function weiToMclaw(wei) {
+  if (wei == null || wei === "") return 0;
+  try { return Number(BigInt(String(wei).trim())) / 1e18; }
+  catch { const n = Number(wei); return Number.isFinite(n) ? n : 0; }
+}
+function normalizeLiveTask(t) {
+  const status = String(t.status || "new");
+  return {
+    id: String(t.id),
+    title: t.title || "Untitled task",
+    agent: t.agentName || t.agent_name || t.agentUsername || t.agent_username || t.agentId || t.agent_id || "agent",
+    verified: !!(t.agentIsVerified || t.agentIsXVerified) || /fund|active|approved|released/i.test(status),
+    desc: t.description || t.desc || "",
+    // Real McClaw tasks carry no structured skills/location/schedule — these are
+    // sensible defaults so scoring, filters and cards still render.
+    location: "Remote", remote: true, skills: [],
+    minYears: 0, minReputation: 0, schedule: "async", timeCommitmentHours: 1,
+    pay: Math.round(weiToMclaw(t.escrowAmount ?? t.escrow_amount ?? 0) * 100) / 100,
+    posted: "new", source: "mcclaw",
+  };
+}
+async function fetchLiveTasks() {
+  if (!MCCLAW_KEY) return null;
+  const res = await fetch(`${MCCLAW_API_BASE}/tasks/?status=new&page_size=50`, {
+    headers: { Accept: "application/json", "X-API-Key": MCCLAW_KEY },
+  });
+  if (!res.ok) throw new Error("McClaw tasks " + res.status);
+  const data = await res.json();
+  return (data.tasks || data || []).map(normalizeLiveTask);
+}
+
 /* ===================== shared logic ===================== */
 const WEIGHTS = { skills: 0.4, location: 0.15, experience: 0.15, availability: 0.15, reputation: 0.15 };
 const COURSE = { spanish: ["spanish", "translation"], "creative writing": ["writing"], "intro to photography": ["photography"] };
@@ -505,9 +542,9 @@ function fitsSchedule(task, profile) {
   }
   return true;
 }
-function Suggested({ profile, applied, onApply, goProfile, onQuiz }) {
+function Suggested({ tasks, profile, applied, onApply, goProfile, onQuiz }) {
   if (!profile) return <div className="empty">Take a 2-minute quiz and your agent starts matching you right away. <button className="link" onClick={onQuiz}>Take the quiz →</button> <span className="empty-or">or</span> <button className="link" onClick={goProfile}>build a full profile</button></div>;
-  const scored = TASKS.filter((t) => !isRefuse(t)).map((t) => ({ ...t, m: scoreTask(profile, t) }));
+  const scored = tasks.filter((t) => !isRefuse(t)).map((t) => ({ ...t, m: scoreTask(profile, t) }));
   const buckets = { likely: [], reach: [], stretch: [] };
   scored.forEach((t) => buckets[tierOf(t.m)].push(t));
   Object.values(buckets).forEach((b) => b.sort((a, z) => z.m.total - a.m.total));
@@ -535,7 +572,7 @@ const DIFF_FILTERS = [["all", "All", null], ["easy", "Easy to get", TrendingUp],
 const SCHED_SEGS = [["any", "Any schedule", null], ["fits", "Fits my schedule", CalendarCheck], ["nofit", "Doesn't fit", CalendarX]];
 const MODE_FILTERS = [["all", "All", null], ["onsite", "In person", MapPin], ["hybrid", "Hybrid", Shuffle], ["remote", "Remote", Wifi]];
 const SEARCH_SAMPLES = ["photography", "writing", "spanish", "voice", "verify", "notary"];
-function AllAvailable({ profile, applied, onApply }) {
+function AllAvailable({ tasks, profile, applied, onApply }) {
   const [q, setQ] = useState("");
   const [diff, setDiff] = useState("all");
   const [sched, setSched] = useState("any");
@@ -558,7 +595,7 @@ function AllAvailable({ profile, applied, onApply }) {
     return () => clearTimeout(to);
   }, [q]);
   const activeFilters = (mode !== "all" ? 1 : 0) + (diff !== "all" ? 1 : 0) + (sched !== "any" ? 1 : 0) + (pay > 0 ? 1 : 0);
-  const list = TASKS.filter((t) => {
+  const list = tasks.filter((t) => {
     if (q && !`${t.title} ${t.skills.join(" ")} ${t.agent}`.toLowerCase().includes(q.toLowerCase())) return false;
     if (mode !== "all" && modeOf(t) !== mode) return false;
     if (pay > 0 && t.pay < pay) return false;
@@ -635,13 +672,13 @@ function AllAvailable({ profile, applied, onApply }) {
 
 /* ===================== Applied ===================== */
 const APP_ST = { hired: { label: "Hired", c: "#2fd286" }, reviewing: { label: "Reviewing", c: "#9bd0ff" } };
-function Applied({ applied, profile, jobStatus, onApply }) {
+function Applied({ tasks, applied, profile, jobStatus, onApply }) {
   const [openId, setOpenId] = useState(null);
-  const list = TASKS.filter((t) => applied.includes(t.id));
+  const list = tasks.filter((t) => applied.includes(t.id));
   if (!list.length) return <div className="empty">No applications yet. Apply from <b>Suggested</b> or <b>All available</b>, and your agent negotiates on your behalf.</div>;
   const statusOf = (id) => (jobStatus && jobStatus[id]) ? "hired" : "reviewing";
   const hired = list.filter((t) => statusOf(t.id) === "hired").length;
-  const openTask = TASKS.find((t) => t.id === openId);
+  const openTask = tasks.find((t) => t.id === openId);
   return (
     <div className="db">
       <div className="db-stats">
@@ -743,8 +780,8 @@ const JOB_STATUS = {
   submitted: { label: "Awaiting validation", c: "#ffd27a", pct: 82, next: "paid", action: "Mark validated" },
   paid: { label: "Paid", c: "#2fd286", pct: 100, next: null, action: null },
 };
-function WorkingOn({ applied, jobStatus, onAdvance }) {
-  const jobs = applied.map((id) => TASKS.find((t) => t.id === id)).filter(Boolean);
+function WorkingOn({ tasks, applied, jobStatus, onAdvance }) {
+  const jobs = applied.map((id) => tasks.find((t) => t.id === id)).filter(Boolean);
   if (!jobs.length) return <div className="empty">Nothing in progress yet. When you take on a task it shows up here with its status, escrow, and next step.</div>;
   return (
     <div className="jobs">
@@ -1529,6 +1566,20 @@ export default function McMatcherProduct() {
   const [profile, setProfile] = useState(null);
   const [applied, setApplied] = useState(["t1", "t3"]);
   const [jobStatus, setJobStatus] = useState({ t1: "in_progress", t3: "submitted" });
+  const [tasks, setTasks] = useState(TASKS);
+  const [live, setLive] = useState(false);
+  useEffect(() => {
+    let alive = true;
+    fetchLiveTasks()
+      .then((list) => {
+        if (alive && list && list.length) {
+          setTasks(list); setLive(true);
+          setApplied([]); setJobStatus({}); // sample demo state doesn't apply to live tasks
+        }
+      })
+      .catch((e) => console.warn("McClaw live tasks unavailable:", e?.message));
+    return () => { alive = false; };
+  }, []);
   const onApply = (id) => { if (!profile) { setTab("profile"); return; } setApplied((a) => (a.includes(id) ? a : [...a, id])); setJobStatus((s) => (s[id] ? s : { ...s, [id]: "in_progress" })); };
   const advance = (id, next) => setJobStatus((s) => ({ ...s, [id]: next }));
   const activeCount = applied.filter((id) => (jobStatus[id] || "in_progress") !== "paid").length;
@@ -1551,14 +1602,14 @@ export default function McMatcherProduct() {
                 {tab === k && <span className="tmk">›</span>}{label.toUpperCase()}{k === "applied" && applied.length ? ` (${applied.length})` : ""}{k === "working" && activeCount ? ` (${activeCount})` : ""}
               </button>
             ))}
-            <div className="ab-prof">{profile ? `${profile.location} · ${profile.hoursPerWeek}h/wk · rep ${profile.reputation}` : "● no profile"}</div>
+            <div className="ab-prof">{live ? `● live · ${tasks.length} tasks · ` : ""}{profile ? `${profile.location} · ${profile.hoursPerWeek}h/wk · rep ${profile.reputation}` : "no profile"}</div>
             <button className={`ab-gear ${tab === "settings" ? "on" : ""}`} title="Settings" onClick={() => setTab("settings")}><Settings size={17} /></button>
           </header>
           <main className="page">
-            {tab === "suggested" && <><h1 className="page-h">Suggested for you</h1><Suggested profile={profile} applied={applied} onApply={onApply} goProfile={() => setTab("profile")} onQuiz={() => setScreen("quiz")} /></>}
-            {tab === "all" && <><h1 className="page-h">All available</h1><AllAvailable profile={profile} applied={applied} onApply={onApply} /></>}
-            {tab === "working" && <><h1 className="page-h">Working on</h1><WorkingOn applied={applied} jobStatus={jobStatus} onAdvance={advance} /></>}
-            {tab === "applied" && <><h1 className="page-h">Applied</h1><Applied applied={applied} profile={profile} jobStatus={jobStatus} onApply={onApply} /></>}
+            {tab === "suggested" && <><h1 className="page-h">Suggested for you</h1><Suggested tasks={tasks} profile={profile} applied={applied} onApply={onApply} goProfile={() => setTab("profile")} onQuiz={() => setScreen("quiz")} /></>}
+            {tab === "all" && <><h1 className="page-h">All available</h1><AllAvailable tasks={tasks} profile={profile} applied={applied} onApply={onApply} /></>}
+            {tab === "working" && <><h1 className="page-h">Working on</h1><WorkingOn tasks={tasks} applied={applied} jobStatus={jobStatus} onAdvance={advance} /></>}
+            {tab === "applied" && <><h1 className="page-h">Applied</h1><Applied tasks={tasks} applied={applied} profile={profile} jobStatus={jobStatus} onApply={onApply} /></>}
             {tab === "profile" && <ProfilePage profile={profile} onSave={setProfile} onQuiz={() => setScreen("quiz")} />}
             {tab === "settings" && <SettingsPage profile={profile} />}
           </main>
