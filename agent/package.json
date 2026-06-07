@@ -1,0 +1,21 @@
+{
+  "name": "mcclaw-agent-bot",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Agent-side McClaw integration: create tasks, watch on-chain events, and auto-accept human applications. Built on the official @mcclaw/sdk.",
+  "bin": {
+    "mcclaw-bot": "./agent-bot.mjs"
+  },
+  "scripts": {
+    "bot": "node agent-bot.mjs",
+    "whoami": "node agent-bot.mjs whoami",
+    "watch": "node agent-bot.mjs watch",
+    "run-bot": "node agent-bot.mjs run"
+  },
+  "dependencies": {
+    "@mcclaw/sdk": "github:mcclawio/sdk-ts",
+    "dotenv": "^16.4.5",
+    "viem": "^2.23.13"
+  }
+}
