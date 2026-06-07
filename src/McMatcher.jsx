@@ -1613,18 +1613,17 @@ export default function McMatcherProduct() {
       .catch((e) => console.warn("McClaw live tasks unavailable:", e?.message));
     return () => { alive = false; };
   }, []);
-  const onApply = async (id) => {
-    if (!profile) { setTab("profile"); return; }
+  const onApply = (id) => {
     const task = tasks.find((t) => t.id === id);
-    if (task && task.source === "mcclaw") {
-      // Redirect to McClaw (opened synchronously so it isn't popup-blocked) where
-      // the user searches the task by name and applies with their wallet.
-      window.open("https://mcclaw.io", "_blank", "noopener,noreferrer");
-      // Best-effort heads-up if it has since closed (non-blocking).
-      try {
-        const d = await (await fetch(`/api/apply?id=${encodeURIComponent(id)}`)).json();
-        if (!d.available) alert(`Heads up: "${task.title}" may no longer be open on McClaw${d.status ? ` (status: ${d.status})` : ""}.`);
-      } catch (e) { /* ignore */ }
+    const isLive = task && task.source === "mcclaw";
+    // Live task → open McClaw right away (synchronously in the click, so the tab
+    // isn't popup-blocked). No profile needed for this redirect.
+    if (isLive) {
+      const w = window.open("https://mcclaw.io", "_blank");
+      if (w) w.opener = null;
+    } else if (!profile) {
+      setTab("profile");
+      return;
     }
     setApplied((a) => (a.includes(id) ? a : [...a, id]));
     setJobStatus((s) => (s[id] ? s : { ...s, [id]: "in_progress" }));
