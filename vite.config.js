@@ -31,6 +31,23 @@ export default defineConfig(({ mode }) => {
           res.end(JSON.stringify({ error: String(e && e.message ? e.message : e) }));
         }
       });
+      // Mirror /api/apply: verify a task is still open before handing off.
+      server.middlewares.use("/api/apply", async (req, res) => {
+        res.setHeader("Content-Type", "application/json");
+        const id = new URL(req.url, "http://localhost").searchParams.get("id");
+        if (!id) { res.statusCode = 400; res.end(JSON.stringify({ error: "missing id" })); return; }
+        if (!KEY) { res.end(JSON.stringify({ available: false, reason: "no-key" })); return; }
+        try {
+          const r = await fetch(`${BASE}/tasks/${id}/`, { headers: { Accept: "application/json", "X-API-Key": KEY } });
+          if (!r.ok) { res.end(JSON.stringify({ available: false, reason: "fetch-" + r.status })); return; }
+          const t = await r.json();
+          const status = String(t.status || "");
+          res.end(JSON.stringify({ available: /new|funded/i.test(status), status, title: t.title }));
+        } catch (e) {
+          res.statusCode = 502;
+          res.end(JSON.stringify({ available: false, error: String(e && e.message ? e.message : e) }));
+        }
+      });
     },
   };
 

@@ -479,6 +479,7 @@ function TaskModal({ task, profile, isApplied, onApply, onClose }) {
               </div>
               <div className="tm-sec"><h4>How you get paid</h4><p>{task.pay} $MCLAW is locked in escrow the moment you're hired. A validator confirms your result, then funds release straight to your wallet — usually within minutes.</p></div>
               <button className={`tc-apply lg ${isApplied ? "done" : ""}`} disabled={isApplied} onClick={() => onApply(task.id)}>{isApplied ? <><Check size={15} /> Applied</> : "Apply via your agent"}</button>
+              {isApplied && task.source === "mcclaw" && <p className="tm-req">Verified open on McClaw. To finalize, the on-chain $MCLAW stake is signed by <b>your wallet</b> at <a href="https://mcclaw.io" target="_blank" rel="noopener" style={{ color: "var(--em)" }}>mcclaw.io</a>.</p>}
             </>
           )}
         </div>
@@ -1612,7 +1613,20 @@ export default function McMatcherProduct() {
       .catch((e) => console.warn("McClaw live tasks unavailable:", e?.message));
     return () => { alive = false; };
   }, []);
-  const onApply = (id) => { if (!profile) { setTab("profile"); return; } setApplied((a) => (a.includes(id) ? a : [...a, id])); setJobStatus((s) => (s[id] ? s : { ...s, [id]: "in_progress" })); };
+  const onApply = async (id) => {
+    if (!profile) { setTab("profile"); return; }
+    const task = tasks.find((t) => t.id === id);
+    if (task && task.source === "mcclaw") {
+      // Real McClaw check: confirm the task is still open before applying. The
+      // final on-chain $MCLAW stake is signed by the user's wallet on mcclaw.io.
+      try {
+        const d = await (await fetch(`/api/apply?id=${encodeURIComponent(id)}`)).json();
+        if (!d.available) { alert(`"${task.title}" is no longer open on McClaw${d.status ? ` (status: ${d.status})` : ""}.`); return; }
+      } catch (e) { /* network hiccup — fall through and record locally */ }
+    }
+    setApplied((a) => (a.includes(id) ? a : [...a, id]));
+    setJobStatus((s) => (s[id] ? s : { ...s, [id]: "in_progress" }));
+  };
   const advance = (id, next) => setJobStatus((s) => ({ ...s, [id]: next }));
   const activeCount = applied.filter((id) => (jobStatus[id] || "in_progress") !== "paid").length;
   const enter = (t) => { setTab(t); setScreen("app"); };
