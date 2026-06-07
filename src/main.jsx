@@ -1,9 +1,9 @@
 import React from "react";
 import { createRoot } from "react-dom/client";
-import McClawProduct from "./McClawProduct.jsx";
+import McMatcherProduct from "./McMatcher.jsx";
 
 createRoot(document.getElementById("root")).render(
   <React.StrictMode>
-    <McClawProduct />
+    <McMatcherProduct />
   </React.StrictMode>,
 );
