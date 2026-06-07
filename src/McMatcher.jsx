@@ -7,11 +7,12 @@ import {
 } from "lucide-react";
 
 /* ===================== live McClaw data ===================== */
-// In dev the Vite proxy forwards /api -> mcclaw.io; in prod vercel.json does the
-// same. The agent X-API-Key comes from VITE_MCCLAW_API_KEY (gitignored .env /
-// Vercel env var). With no key we fall back to the sample TASKS below.
-const MCCLAW_API_BASE = import.meta.env.VITE_MCCLAW_API_BASE || "/api/v1";
-const MCCLAW_KEY = import.meta.env.VITE_MCCLAW_API_KEY || "";
+// The agent key stays server-side: /api/tasks is a Vercel serverless function
+// (api/tasks.js) — emulated in dev by a Vite middleware — that injects the
+// X-API-Key and proxies the McClaw marketplace, so the key never reaches the
+// browser bundle. With no key configured the endpoint returns {tasks:[]} and we
+// fall back to the sample TASKS below.
+const LIVE_TASKS_URL = import.meta.env.VITE_LIVE_TASKS_URL || "/api/tasks";
 function weiToMclaw(wei) {
   if (wei == null || wei === "") return 0;
   try { return Number(BigInt(String(wei).trim())) / 1e18; }
@@ -34,10 +35,7 @@ function normalizeLiveTask(t) {
   };
 }
 async function fetchLiveTasks() {
-  if (!MCCLAW_KEY) return null;
-  const res = await fetch(`${MCCLAW_API_BASE}/tasks/?status=new&page_size=50`, {
-    headers: { Accept: "application/json", "X-API-Key": MCCLAW_KEY },
-  });
+  const res = await fetch(LIVE_TASKS_URL, { headers: { Accept: "application/json" } });
   if (!res.ok) throw new Error("McClaw tasks " + res.status);
   const data = await res.json();
   return (data.tasks || data || []).map(normalizeLiveTask);
