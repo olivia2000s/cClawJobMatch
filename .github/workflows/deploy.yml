@@ -32,6 +32,8 @@ jobs:
       - run: npm ci
       - run: npm run build
       - uses: actions/configure-pages@v5
+        with:
+          enablement: true # turn on Pages automatically on first run (needs a public repo or a paid plan)
       - uses: actions/upload-pages-artifact@v3
         with:
           path: dist
