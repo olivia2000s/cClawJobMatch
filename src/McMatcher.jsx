@@ -26,7 +26,45 @@ const LS_APPLIED = "mcclaw.applied";
 const LS_JOBSTATUS = "mcclaw.jobStatus";
 const LS_STAKED = "mcclaw.staked";
 const LS_AISCORES = "mcclaw.aiScores";
-const LS_ACCOUNT = "mcclaw.account"; // signed-in wallet address (namespaces the above)
+const LS_ACCOUNT = "mcclaw.account"; // signed-in identity (namespaces the above)
+const LS_USERS = "mcclaw.users";     // local username/password accounts
+
+/* ===================== local auth (no backend) =====================
+   Demo-grade username/password stored in this browser. Passwords are hashed
+   (SHA-256 with a per-user salt) so they're not kept in plaintext — but this is
+   NOT real security: localStorage is readable on this device and there's no
+   server, so accounts don't sync across devices. Account id is "user:<name>". */
+function getUsers() { return load(LS_USERS, {}); }
+function randSalt() {
+  const a = new Uint8Array(16); crypto.getRandomValues(a);
+  return Array.from(a, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+async function hashPw(password, salt) {
+  const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(`${salt}:${password}`));
+  return Array.from(new Uint8Array(buf), (b) => b.toString(16).padStart(2, "0")).join("");
+}
+async function signUpUser(username, password) {
+  const key = String(username || "").trim().toLowerCase();
+  if (key.length < 3) throw new Error("Username must be at least 3 characters.");
+  if (!/^[a-z0-9_.-]+$/.test(key)) throw new Error("Use letters, numbers, . _ - only.");
+  if (String(password).length < 6) throw new Error("Password must be at least 6 characters.");
+  const users = getUsers();
+  if (users[key]) throw new Error("That username is taken — try logging in.");
+  const salt = randSalt();
+  users[key] = { salt, hash: await hashPw(password, salt), display: String(username).trim() };
+  save(LS_USERS, users);
+  return `user:${key}`;
+}
+async function logInUser(username, password) {
+  const key = String(username || "").trim().toLowerCase();
+  const u = getUsers()[key];
+  if (!u) throw new Error("No account with that username.");
+  if ((await hashPw(password, u.salt)) !== u.hash) throw new Error("Wrong password.");
+  return `user:${key}`;
+}
+// Display + type helpers for the active account string.
+const acctLabel = (a) => (!a ? "" : a.startsWith("user:") ? `@${a.slice(5)}` : shortAddr(a));
+const acctIsWallet = (a) => !!a && !a.startsWith("user:");
 
 /* ===================== wallet (ethers) ===================== */
 // Optional: set VITE_MCLAW_TOKEN_ADDRESS to the $MCLAW ERC-20 to read balances.
@@ -1375,6 +1413,24 @@ const STYLE = `
 .sort-chip{ font-size:12px; font-weight:600; padding:5px 11px; border-radius:999px; border:1px solid var(--line); background:transparent; color:var(--mut); cursor:pointer; }
 .sort-chip:hover{ color:var(--txt); border-color:#2b5141; }
 .sort-chip.on{ background:var(--em); color:#06100b; border-color:var(--em); }
+.auth-wrap{ min-height:100vh; display:grid; place-items:center; padding:24px; background:radial-gradient(1200px 600px at 50% -10%, rgba(47,210,134,.10), transparent), var(--bg); }
+.auth-card{ position:relative; width:100%; max-width:380px; background:var(--bg2); border:1px solid var(--line); border-radius:18px; padding:30px 28px; box-shadow:0 24px 60px rgba(0,0,0,.45); }
+.auth-x{ position:absolute; top:14px; right:14px; background:transparent; border:none; color:var(--mut); cursor:pointer; }
+.auth-x:hover{ color:var(--txt); }
+.auth-logo{ color:var(--em); font-size:15px; font-weight:800; letter-spacing:.5px; }
+.auth-h{ margin:14px 0 4px; font-size:22px; color:var(--txt); }
+.auth-sub{ margin:0 0 18px; color:var(--mut); font-size:13px; line-height:1.5; }
+.auth-form{ display:flex; flex-direction:column; }
+.auth-lbl{ font-size:12px; font-weight:700; color:var(--mut); text-transform:uppercase; letter-spacing:.5px; margin:10px 0 6px; }
+.auth-form .inp{ width:100%; }
+.auth-err{ display:flex; align-items:center; gap:6px; margin-top:12px; color:#ff8a72; font-size:12.5px; }
+.auth-submit{ width:100%; margin-top:18px; justify-content:center; }
+.auth-toggle{ margin-top:14px; text-align:center; color:var(--mut); font-size:13px; }
+.auth-or{ display:flex; align-items:center; gap:12px; margin:18px 0; color:var(--mut); font-size:12px; }
+.auth-or::before,.auth-or::after{ content:""; flex:1; height:1px; background:var(--line); }
+.auth-wallet{ width:100%; justify-content:center; }
+.auth-guest{ display:block; width:100%; margin-top:14px; text-align:center; }
+.auth-note{ margin:16px 0 0; text-align:center; color:var(--mut); font-size:11px; line-height:1.5; }
 .fgroup-pay{ gap:16px; }
 .pay-val{ font-family:'JetBrains Mono',monospace; font-size:13px; color:var(--em); min-width:120px; text-align:right; flex:none; }
 .ab-gear{ margin-left:16px; width:34px; height:34px; border-radius:9px; background:transparent; border:1px solid var(--line); color:var(--mut); display:grid; place-items:center; cursor:pointer; flex:none; }
@@ -1714,6 +1770,54 @@ function quizToProfile(a) {
   };
 }
 
+// Local username/password auth screen. Also offers optional wallet sign-in and
+// a guest path so nothing is hard-gated.
+function AuthScreen({ initialMode, onAuth, onWallet, onGuest, onClose, walletBusy, walletErr }) {
+  const [mode, setMode] = useState(initialMode === "signup" ? "signup" : "login");
+  const [u, setU] = useState("");
+  const [p, setP] = useState("");
+  const [err, setErr] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const submit = async (e) => {
+    e.preventDefault();
+    setErr(null); setBusy(true);
+    try {
+      const acct = mode === "signup" ? await signUpUser(u, p) : await logInUser(u, p);
+      onAuth(acct, mode === "signup");
+    } catch (ex) { setErr(ex.message || "Something went wrong."); } finally { setBusy(false); }
+  };
+  return (
+    <div className="auth-wrap">
+      <div className="auth-card">
+        <button className="auth-x" onClick={onClose} title="Back"><X size={18} /></button>
+        <div className="auth-logo mono">&gt;_ McMatcher</div>
+        <h2 className="auth-h">{mode === "signup" ? "Create your account" : "Welcome back"}</h2>
+        <p className="auth-sub">{mode === "signup" ? "Pick a username and password — saved on this device." : "Log in to pick up where you left off."}</p>
+        <form onSubmit={submit} className="auth-form">
+          <label className="auth-lbl">Username</label>
+          <input className="inp" value={u} autoFocus autoCapitalize="none" autoCorrect="off" spellCheck={false}
+            placeholder="e.g. jordan_r" onChange={(e) => { setU(e.target.value); setErr(null); }} />
+          <label className="auth-lbl">Password</label>
+          <input className="inp" type="password" value={p} placeholder={mode === "signup" ? "at least 6 characters" : "your password"}
+            autoComplete={mode === "signup" ? "new-password" : "current-password"} onChange={(e) => { setP(e.target.value); setErr(null); }} />
+          {err && <div className="auth-err"><ShieldAlert size={13} /> {err}</div>}
+          <button className="btn auth-submit" type="submit" disabled={busy}>{busy ? "…" : mode === "signup" ? "Sign up" : "Log in"}</button>
+        </form>
+        <div className="auth-toggle">
+          {mode === "signup"
+            ? <>Already have an account? <button className="link" onClick={() => { setMode("login"); setErr(null); }}>Log in</button></>
+            : <>New here? <button className="link" onClick={() => { setMode("signup"); setErr(null); }}>Create an account</button></>}
+        </div>
+        <div className="auth-or"><span>or</span></div>
+        <button className="btn-ghost auth-wallet" onClick={onWallet} disabled={walletBusy}><Wallet size={15} /> {walletBusy ? "Signing in…" : "Continue with wallet"}</button>
+        {walletErr && <div className="auth-err"><ShieldAlert size={13} /> {walletErr}</div>}
+        <button className="link auth-guest" onClick={onGuest}>Continue as guest</button>
+        <p className="auth-note">Local demo accounts: stored only in this browser, not synced across devices.</p>
+      </div>
+    </div>
+  );
+}
+
 const QUIZ_STEPS = ["ratings", "comfortable", "time", "inPerson", "city", "travel", "persona", "priority"];
 
 function OnboardingQuiz({ onComplete, onSkip, onClose }) {
@@ -1862,7 +1966,7 @@ const QUIZ_CSS = `
 function Toggle({ on, onChange }) {
   return <button className={`tgl ${on ? "on" : ""}`} onClick={() => onChange(!on)} role="switch" aria-checked={on}><span className="tgl-knob" /></button>;
 }
-function SettingsPage({ profile, aiKey, onAiKey, account, onSignIn, onSignOut }) {
+function SettingsPage({ profile, aiKey, onAiKey, account, onLogin, onWallet, onLogOut }) {
   const w = useWallet();
   const [notif, setNotif] = useState({ matches: true, expiring: true, paid: true, digest: false });
   const [privacy, setPrivacy] = useState({ visible: true, showLoc: true });
@@ -1880,13 +1984,14 @@ function SettingsPage({ profile, aiKey, onAiKey, account, onSignIn, onSignOut })
       <section className="sc">
         <div className="sc-head"><Wallet size={16} /> Account &amp; wallet</div>
         <div className="sc-row">
-          <div><b>{account ? "Signed in" : "Sign in"}</b><span>{account ? `${shortAddr(account)}${w.balance != null ? ` · ${Math.round(w.balance)} $MCLAW` : ""}` : "Browsing as guest — sign in to tie your saved data to your wallet"}</span></div>
+          <div><b>{account ? "Signed in" : "Not signed in"}</b><span>{account ? `${acctLabel(account)}${acctIsWallet(account) && w.balance != null ? ` · ${Math.round(w.balance)} $MCLAW` : ""}` : "Browsing as guest — log in to keep your own profile & applications"}</span></div>
           {account
-            ? <button className="btn-ghost sm" onClick={onSignOut}>Sign out</button>
-            : <button className="btn-ghost sm" onClick={onSignIn} disabled={w.connecting}>{w.connecting ? "Signing in…" : "Sign in with wallet"}</button>}
+            ? <button className="btn-ghost sm" onClick={onLogOut}>Log out</button>
+            : <button className="btn-ghost sm" onClick={onLogin}>Log in / sign up</button>}
         </div>
+        {!account && <button className="btn-ghost sm" style={{ marginTop: 8 }} onClick={onWallet} disabled={w.connecting}><Wallet size={13} /> {w.connecting ? "Signing in…" : "Continue with wallet"}</button>}
         {w.error && <div className="sc-hint err">{w.error}</div>}
-        <p className="sc-hint">Sign-in is local to this browser: it scopes your profile &amp; applications to your wallet on this device. There's no server, so it doesn't sync across devices.</p>
+        <p className="sc-hint">Accounts are local to this browser — your profile &amp; applications are scoped to your login on this device. There's no server, so they don't sync across devices.</p>
         <div className="sc-field"><label>Display name</label><input value={name} onChange={(e) => setName(e.target.value)} placeholder="How agents see you" /></div>
         <div className="sc-field"><label>Email for alerts</label><input value={email} onChange={(e) => setEmail(e.target.value)} placeholder="you@email.com" type="email" /></div>
       </section>
@@ -1986,8 +2091,6 @@ function McMatcherApp() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [account]);
   // Optional sign-in: connect + sign, then namespace data to that wallet.
-  const signInWallet = async () => { const addr = await wallet.signIn?.(); if (addr) setAccount(addr); };
-  const signOut = () => { setAccount(null); wallet.disconnect?.(); };
   const [tasks, setTasks] = useState(TASKS);
   const [live, setLive] = useState(false);
   const [loadingLive, setLoadingLive] = useState(true);
@@ -2095,12 +2198,20 @@ function McMatcherApp() {
   const activeCount = applied.filter((id) => !["paid", "closed", "rejected", "approved"].includes(jobKeyFor(tasks.find((x) => x.id === id), jobStatus))).length;
   const enter = (t) => { setTab(t); setScreen("app"); };
   const finishQuiz = (p) => { setProfile(p); enter("suggested"); };
+  // Auth: local username/password (account id "user:<name>") or optional wallet.
+  const [authMode, setAuthMode] = useState("login");
+  const openAuth = (mode) => { setAuthMode(mode); setScreen("auth"); };
+  const onAuth = (acct, isNew) => { setAccount(acct); if (isNew) setScreen("quiz"); else enter("suggested"); };
+  const walletAuth = async () => { const addr = await wallet.signIn?.(); if (addr) { setAccount(addr); enter("suggested"); } };
+  const logOut = () => { setAccount(null); if (acctIsWallet(account)) wallet.disconnect?.(); setScreen("landing"); };
 
   return (
     <div className="root">
       <style>{STYLE}</style>
       {screen === "landing" ? (
-        <Landing onSignup={() => setScreen("quiz")} onEnter={() => enter("suggested")} onBrowse={() => enter("all")} />
+        <Landing onSignup={() => openAuth("signup")} onEnter={() => openAuth("login")} onBrowse={() => enter("all")} />
+      ) : screen === "auth" ? (
+        <AuthScreen initialMode={authMode} onAuth={onAuth} onWallet={walletAuth} onGuest={() => enter("all")} onClose={() => setScreen("landing")} walletBusy={wallet.connecting} walletErr={wallet.error} />
       ) : screen === "quiz" ? (
         <OnboardingQuiz onComplete={finishQuiz} onSkip={() => enter("all")} onClose={() => setScreen("landing")} />
       ) : (
@@ -2127,12 +2238,12 @@ function McMatcherApp() {
             </button>
             <div className="ab-prof">{profile ? `${profile.location} · ${profile.hoursPerWeek}h/wk · rep ${profile.reputation}` : "no profile"}</div>
             {account ? (
-              <button className="ab-wallet on" title={`Signed in as ${account}${wallet.balance != null ? ` · ${wallet.balance} $MCLAW` : ""} — click to sign out`} onClick={signOut}>
-                <Wallet size={14} />{shortAddr(account)}
+              <button className="ab-wallet on" title={`Signed in as ${acctLabel(account)}${acctIsWallet(account) && wallet.balance != null ? ` · ${wallet.balance} $MCLAW` : ""} — click to log out`} onClick={logOut}>
+                {acctIsWallet(account) ? <Wallet size={14} /> : null}{acctLabel(account)}
               </button>
             ) : (
-              <button className="ab-wallet" onClick={signInWallet} disabled={wallet.connecting} title={wallet.error || "Sign in with your wallet (optional) — keeps your saved data tied to this wallet"}>
-                <Wallet size={14} />{wallet.connecting ? "Signing in…" : "Sign in"}
+              <button className="ab-wallet" onClick={() => openAuth("login")} title="Log in or create an account">
+                Log in
               </button>
             )}
             <button className={`ab-gear ${tab === "settings" ? "on" : ""}`} title="Settings" onClick={() => setTab("settings")}><Settings size={17} /></button>
@@ -2143,7 +2254,7 @@ function McMatcherApp() {
             {tab === "working" && <><h1 className="page-h">Working on</h1><WorkingOn tasks={tasks} applied={applied} jobStatus={jobStatus} onAdvance={advance} /></>}
             {tab === "applied" && <><h1 className="page-h">Applied</h1><Applied tasks={tasks} applied={applied} profile={profile} jobStatus={jobStatus} staked={staked} onConfirmStake={onConfirmStake} onUnapply={onUnapply} aiScores={aiScores} /></>}
             {tab === "profile" && <ProfilePage profile={profile} onSave={setProfile} onQuiz={() => setScreen("quiz")} />}
-            {tab === "settings" && <SettingsPage profile={profile} aiKey={aiKey} onAiKey={setAiKey} account={account} onSignIn={signInWallet} onSignOut={signOut} />}
+            {tab === "settings" && <SettingsPage profile={profile} aiKey={aiKey} onAiKey={setAiKey} account={account} onLogin={() => openAuth("login")} onWallet={walletAuth} onLogOut={logOut} />}
           </main>
         </>
       )}
