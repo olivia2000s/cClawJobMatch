@@ -26,6 +26,7 @@ const LS_APPLIED = "mcclaw.applied";
 const LS_JOBSTATUS = "mcclaw.jobStatus";
 const LS_STAKED = "mcclaw.staked";
 const LS_AISCORES = "mcclaw.aiScores";
+const LS_ACCOUNT = "mcclaw.account"; // signed-in wallet address (namespaces the above)
 
 /* ===================== wallet (ethers) ===================== */
 // Optional: set VITE_MCLAW_TOKEN_ADDRESS to the $MCLAW ERC-20 to read balances.
@@ -64,33 +65,35 @@ function useWalletState() {
     finally { setConnecting(false); }
   }, [readBalance]);
   const disconnect = React.useCallback(() => { setAddress(null); setBalance(null); setError(null); }, []);
+  // Sign-In With Ethereum: connect, then prove wallet ownership with a signature.
+  // Returns the address on success (the app uses it to namespace saved data).
+  const signIn = React.useCallback(async () => {
+    if (!window.ethereum) { setError("No Ethereum wallet found — install MetaMask to sign in."); return null; }
+    setConnecting(true); setError(null);
+    try {
+      const provider = new BrowserProvider(window.ethereum);
+      const accs = await provider.send("eth_requestAccounts", []);
+      const addr = accs && accs[0];
+      if (!addr) return null;
+      const signer = await provider.getSigner();
+      const issued = new Date().toISOString();
+      await signer.signMessage(`Sign in to McMatcher\n\nWallet: ${addr}\nIssued: ${issued}\n\nThis signature only proves you control this wallet. It costs no gas and authorizes nothing on-chain.`);
+      setAddress(addr); readBalance(addr);
+      return addr;
+    } catch (e) { setError(e?.shortMessage || e?.message || "Sign-in cancelled"); return null; }
+    finally { setConnecting(false); }
+  }, [readBalance]);
   useEffect(() => {
     if (!window.ethereum?.on) return;
     const onAcc = (accs) => { const a = accs && accs[0]; setAddress(a || null); if (a) readBalance(a); else setBalance(null); };
     window.ethereum.on("accountsChanged", onAcc);
     return () => window.ethereum.removeListener?.("accountsChanged", onAcc);
   }, [readBalance]);
-  return { address, balance, connecting, error, connect, disconnect, hasToken: !!MCLAW_TOKEN_ADDRESS };
+  return { address, balance, connecting, error, connect, disconnect, signIn, hasToken: !!MCLAW_TOKEN_ADDRESS };
 }
 const useWallet = () => React.useContext(WalletCtx) || {};
 function WalletProvider({ children }) {
   return <WalletCtx.Provider value={useWalletState()}>{children}</WalletCtx.Provider>;
-}
-function WalletButton() {
-  const w = useWallet();
-  if (!w.connect) return null;
-  if (w.address) {
-    return (
-      <button className="ab-wallet on" title={`${w.address}${w.balance != null ? ` · ${w.balance} $MCLAW` : ""} — click to disconnect`} onClick={w.disconnect}>
-        <Wallet size={14} />{shortAddr(w.address)}{w.balance != null ? ` · ${Math.round(w.balance)}` : ""}
-      </button>
-    );
-  }
-  return (
-    <button className="ab-wallet" onClick={w.connect} disabled={w.connecting} title={w.error || "Connect your wallet"}>
-      <Wallet size={14} />{w.connecting ? "Connecting…" : "Connect wallet"}
-    </button>
-  );
 }
 // Pre-hand-off balance check shown inside the live-task steps.
 function WalletStakeNote({ pay }) {
@@ -565,6 +568,7 @@ function MatchPanel({ m, ai }) {
 }
 
 function TaskModal({ task, profile, isApplied, isPending, ai, onApply, onConfirmStake, onUnapply, onClose }) {
+  const [retracting, setRetracting] = useState(false);
   useEffect(() => {
     const onKey = (e) => { if (e.key === "Escape") onClose(); };
     window.addEventListener("keydown", onKey); document.body.style.overflow = "hidden";
@@ -636,11 +640,26 @@ function TaskModal({ task, profile, isApplied, isPending, ai, onApply, onConfirm
                   </div>
                   <button className="tm-unapply" onClick={() => { onUnapply(task.id); onClose(); }}>Cancel application</button>
                 </>
+              ) : retracting ? (
+                <>
+                  <div className="tm-steps">
+                    <h4>Retract on McClaw</h4>
+                    <p>Your $MCLAW stake lives on McClaw — unstake it there to actually retract, then remove it from your list here.</p>
+                    <a className="tm-steps-link" href={MCCLAW_HOME} target="_blank" rel="noopener noreferrer">Open mcclaw.io <ArrowRight size={14} /></a>
+                    <ol className="tm-steps-list">
+                      <li>On <b>mcclaw.io</b>, connect your wallet.</li>
+                      <li>Go to <b>Tasks</b> and open <b>“{task.title}”</b>.</li>
+                      <li><b>Unstake to retract your application</b> — confirm in your wallet.</li>
+                    </ol>
+                    <button className="tc-apply lg" onClick={() => { onUnapply(task.id); onClose(); }}><Check size={15} /> I've retracted on McClaw — remove it</button>
+                  </div>
+                  <button className="tm-unapply" onClick={() => setRetracting(false)}>Keep it</button>
+                </>
               ) : (
                 <>
                   <button className="tc-apply lg done" disabled><Check size={15} /> Applied</button>
                   {task.source === "mcclaw" && <p className="tm-staked"><Check size={13} /> Applied on McClaw — your application is in.</p>}
-                  <button className="tm-unapply" onClick={() => { onUnapply(task.id); onClose(); }}>Withdraw application</button>
+                  <button className="tm-unapply" onClick={() => { if (task.source === "mcclaw") setRetracting(true); else { onUnapply(task.id); onClose(); } }}>Retract application</button>
                 </>
               )}
             </>
@@ -1843,7 +1862,7 @@ const QUIZ_CSS = `
 function Toggle({ on, onChange }) {
   return <button className={`tgl ${on ? "on" : ""}`} onClick={() => onChange(!on)} role="switch" aria-checked={on}><span className="tgl-knob" /></button>;
 }
-function SettingsPage({ profile, aiKey, onAiKey }) {
+function SettingsPage({ profile, aiKey, onAiKey, account, onSignIn, onSignOut }) {
   const w = useWallet();
   const [notif, setNotif] = useState({ matches: true, expiring: true, paid: true, digest: false });
   const [privacy, setPrivacy] = useState({ visible: true, showLoc: true });
@@ -1861,12 +1880,13 @@ function SettingsPage({ profile, aiKey, onAiKey }) {
       <section className="sc">
         <div className="sc-head"><Wallet size={16} /> Account &amp; wallet</div>
         <div className="sc-row">
-          <div><b>Connected wallet</b><span>{w.address ? `${shortAddr(w.address)}${w.balance != null ? ` · ${Math.round(w.balance)} $MCLAW` : ""}` : "Not connected"}</span></div>
-          {w.address
-            ? <button className="btn-ghost sm" onClick={w.disconnect}>Disconnect</button>
-            : <button className="btn-ghost sm" onClick={w.connect} disabled={w.connecting}>{w.connecting ? "Connecting…" : "Connect"}</button>}
+          <div><b>{account ? "Signed in" : "Sign in"}</b><span>{account ? `${shortAddr(account)}${w.balance != null ? ` · ${Math.round(w.balance)} $MCLAW` : ""}` : "Browsing as guest — sign in to tie your saved data to your wallet"}</span></div>
+          {account
+            ? <button className="btn-ghost sm" onClick={onSignOut}>Sign out</button>
+            : <button className="btn-ghost sm" onClick={onSignIn} disabled={w.connecting}>{w.connecting ? "Signing in…" : "Sign in with wallet"}</button>}
         </div>
         {w.error && <div className="sc-hint err">{w.error}</div>}
+        <p className="sc-hint">Sign-in is local to this browser: it scopes your profile &amp; applications to your wallet on this device. There's no server, so it doesn't sync across devices.</p>
         <div className="sc-field"><label>Display name</label><input value={name} onChange={(e) => setName(e.target.value)} placeholder="How agents see you" /></div>
         <div className="sc-field"><label>Email for alerts</label><input value={email} onChange={(e) => setEmail(e.target.value)} placeholder="you@email.com" type="email" /></div>
       </section>
@@ -1915,22 +1935,35 @@ function SettingsPage({ profile, aiKey, onAiKey }) {
 }
 
 const TABS = [["suggested", "Suggested"], ["all", "All available"], ["working", "Working on"], ["applied", "Applied"], ["profile", "Profile"]];
+// Provider sits above the app so the body can read the wallet + manage the
+// signed-in account (used to namespace saved data).
 export default function McMatcherProduct() {
+  return <WalletProvider><McMatcherApp /></WalletProvider>;
+}
+function McMatcherApp() {
+  const wallet = useWallet();
   const [screen, setScreen] = useState("landing");
   const [tab, setTab] = useState("suggested");
+  // Optional wallet sign-in. `account` is the signed-in address (or null = guest).
+  // Saved data is namespaced by it so each wallet keeps its own profile/apps on
+  // this device, while guests still get the demo seeds. Auth is local-only —
+  // there's no backend, so this scopes data, it doesn't secure or sync it.
+  const [account, setAccount] = useState(() => load(LS_ACCOUNT, null));
+  const k = (base) => (account ? `${base}::${account.toLowerCase()}` : base);
   // Profile + applications persist to localStorage so a refresh doesn't wipe
-  // them. Demo seeds (t1/t3) are the first-run default only.
-  const [profile, setProfile] = useState(() => load(LS.profile, null));
-  const [applied, setApplied] = useState(() => load(LS_APPLIED, ["t1", "t3"]));
-  const [jobStatus, setJobStatus] = useState(() => load(LS_JOBSTATUS, { t1: "in_progress", t3: "submitted" }));
+  // them. Demo seeds (t1/t3) are the first-run default for guests only.
+  const [profile, setProfile] = useState(() => load(k(LS.profile), null));
+  const [applied, setApplied] = useState(() => load(k(LS_APPLIED), account ? [] : ["t1", "t3"]));
+  const [jobStatus, setJobStatus] = useState(() => load(k(LS_JOBSTATUS), account ? {} : { t1: "in_progress", t3: "submitted" }));
   // Live McClaw tasks: applying is an on-chain $MCLAW stake the user signs on
   // mcclaw.io — we can't do it for them. `staked[id]` flips true once the user
   // confirms they've completed that hand-off. Demo tasks skip this entirely.
-  const [staked, setStaked] = useState(() => load(LS_STAKED, {}));
-  useEffect(() => save(LS.profile, profile), [profile]);
-  useEffect(() => save(LS_APPLIED, applied), [applied]);
-  useEffect(() => save(LS_JOBSTATUS, jobStatus), [jobStatus]);
-  useEffect(() => save(LS_STAKED, staked), [staked]);
+  const [staked, setStaked] = useState(() => load(k(LS_STAKED), {}));
+  useEffect(() => save(LS_ACCOUNT, account), [account]);
+  useEffect(() => save(k(LS.profile), profile), [profile]);
+  useEffect(() => save(k(LS_APPLIED), applied), [applied]);
+  useEffect(() => save(k(LS_JOBSTATUS), jobStatus), [jobStatus]);
+  useEffect(() => save(k(LS_STAKED), staked), [staked]);
   // AI matching: real Claude scores keyed by task id. Needs an Anthropic key
   // (from Settings or VITE_ANTHROPIC_API_KEY). Scores persist so we don't re-pay.
   const [aiKey, setAiKey] = useState(() => load(LS.anthropicKey, "") || ENV_ANTHROPIC_KEY);
@@ -1938,8 +1971,23 @@ export default function McMatcherProduct() {
   const [scoring, setScoring] = useState({ active: false, done: 0, total: 0 });
   const scoreAbort = useRef(null);
   const aiScoresRef = useRef(aiScores); aiScoresRef.current = aiScores;
-  useEffect(() => save(LS.anthropicKey, aiKey), [aiKey]);
-  useEffect(() => save(LS_AISCORES, aiScores), [aiScores]);
+  useEffect(() => save(LS.anthropicKey, aiKey), [aiKey]); // API key is global, not per-wallet
+  useEffect(() => save(k(LS_AISCORES), aiScores), [aiScores]);
+  // When the signed-in account changes (sign in / out / wallet switch), swap to
+  // that namespace's saved data. Skip the first run (state already loaded above).
+  const firstNs = useRef(true);
+  useEffect(() => {
+    if (firstNs.current) { firstNs.current = false; return; }
+    setProfile(load(k(LS.profile), null));
+    setApplied(load(k(LS_APPLIED), account ? [] : ["t1", "t3"]));
+    setJobStatus(load(k(LS_JOBSTATUS), account ? {} : { t1: "in_progress", t3: "submitted" }));
+    setStaked(load(k(LS_STAKED), {}));
+    setAiScores(load(k(LS_AISCORES), {}));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [account]);
+  // Optional sign-in: connect + sign, then namespace data to that wallet.
+  const signInWallet = async () => { const addr = await wallet.signIn?.(); if (addr) setAccount(addr); };
+  const signOut = () => { setAccount(null); wallet.disconnect?.(); };
   const [tasks, setTasks] = useState(TASKS);
   const [live, setLive] = useState(false);
   const [loadingLive, setLoadingLive] = useState(true);
@@ -2049,7 +2097,6 @@ export default function McMatcherProduct() {
   const finishQuiz = (p) => { setProfile(p); enter("suggested"); };
 
   return (
-    <WalletProvider>
     <div className="root">
       <style>{STYLE}</style>
       {screen === "landing" ? (
@@ -2079,7 +2126,15 @@ export default function McMatcherProduct() {
               <Sparkles size={14} />{scoring.active ? `SCORING ${scoring.done}/${scoring.total}` : "SCORE WITH CLAUDE"}
             </button>
             <div className="ab-prof">{profile ? `${profile.location} · ${profile.hoursPerWeek}h/wk · rep ${profile.reputation}` : "no profile"}</div>
-            <WalletButton />
+            {account ? (
+              <button className="ab-wallet on" title={`Signed in as ${account}${wallet.balance != null ? ` · ${wallet.balance} $MCLAW` : ""} — click to sign out`} onClick={signOut}>
+                <Wallet size={14} />{shortAddr(account)}
+              </button>
+            ) : (
+              <button className="ab-wallet" onClick={signInWallet} disabled={wallet.connecting} title={wallet.error || "Sign in with your wallet (optional) — keeps your saved data tied to this wallet"}>
+                <Wallet size={14} />{wallet.connecting ? "Signing in…" : "Sign in"}
+              </button>
+            )}
             <button className={`ab-gear ${tab === "settings" ? "on" : ""}`} title="Settings" onClick={() => setTab("settings")}><Settings size={17} /></button>
           </header>
           <main className="page">
@@ -2088,11 +2143,10 @@ export default function McMatcherProduct() {
             {tab === "working" && <><h1 className="page-h">Working on</h1><WorkingOn tasks={tasks} applied={applied} jobStatus={jobStatus} onAdvance={advance} /></>}
             {tab === "applied" && <><h1 className="page-h">Applied</h1><Applied tasks={tasks} applied={applied} profile={profile} jobStatus={jobStatus} staked={staked} onConfirmStake={onConfirmStake} onUnapply={onUnapply} aiScores={aiScores} /></>}
             {tab === "profile" && <ProfilePage profile={profile} onSave={setProfile} onQuiz={() => setScreen("quiz")} />}
-            {tab === "settings" && <SettingsPage profile={profile} aiKey={aiKey} onAiKey={setAiKey} />}
+            {tab === "settings" && <SettingsPage profile={profile} aiKey={aiKey} onAiKey={setAiKey} account={account} onSignIn={signInWallet} onSignOut={signOut} />}
           </main>
         </>
       )}
     </div>
-    </WalletProvider>
   );
 }
