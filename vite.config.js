@@ -52,6 +52,10 @@ export default defineConfig(({ mode }) => {
   };
 
   return {
+    // GitHub Pages serves the app from /<repo>/, so prod assets need that base
+    // path. Dev/preview stays at root. Override with VITE_BASE if the repo is
+    // renamed or served from a custom domain (set VITE_BASE=/ for the latter).
+    base: env.VITE_BASE || (mode === "production" ? "/cClawJobMatch/" : "/"),
     plugins: [react(), liveTasksDev],
     server: {
       proxy: {
