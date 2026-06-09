@@ -1,4 +1,5 @@
 import React, { useState, useMemo, useRef, useEffect } from "react";
+import { BrowserProvider, Contract, formatUnits } from "ethers";
 import {
   Camera, Languages, Utensils, MessageCircle, Wrench, Mic, Stamp, PenLine, Briefcase,
   ShieldCheck, ShieldAlert, Bot, Search, MapPin, Wifi, Clock, Coins, Sparkles, Check,
@@ -13,10 +14,117 @@ import {
 // browser bundle. With no key configured the endpoint returns {tasks:[]} and we
 // fall back to the sample TASKS below.
 const LIVE_TASKS_URL = import.meta.env.VITE_LIVE_TASKS_URL || "/api/tasks";
+// Server-side availability check (injects the agent key) — confirms a task is
+// still open/funded before we walk the user through the on-chain hand-off.
+const APPLY_VERIFY_URL = import.meta.env.VITE_APPLY_VERIFY_URL || "/api/apply";
+// Public task page on McClaw — deep-link straight to the gig so the user doesn't
+// have to search for it by title.
+const MCCLAW_TASK_URL = import.meta.env.VITE_MCCLAW_TASK_URL || "https://mcclaw.io/tasks";
+const taskUrl = (task) => `${MCCLAW_TASK_URL}/${task.mcId ?? task.id}`;
+// Returns { available, status, title } | { available, reason }. Never throws to
+// the caller's happy path — a network hiccup resolves to `unknown` so we don't
+// block a legitimate application on a flaky check.
+async function verifyTaskOpen(mcId) {
+  try {
+    const res = await fetch(`${APPLY_VERIFY_URL}?id=${encodeURIComponent(mcId)}`, { headers: { Accept: "application/json" } });
+    if (!res.ok) return { available: null, reason: "http-" + res.status };
+    return await res.json();
+  } catch (e) {
+    return { available: null, reason: e?.message || "unreachable" };
+  }
+}
+
+/* ===================== wallet (ethers) ===================== */
+// Optional: set VITE_MCLAW_TOKEN_ADDRESS to the $MCLAW ERC-20 to read balances.
+// Without it we still connect and show the address — just no balance.
+const MCLAW_TOKEN_ADDRESS = import.meta.env.VITE_MCLAW_TOKEN_ADDRESS || "";
+const ERC20_ABI = [
+  "function balanceOf(address) view returns (uint256)",
+  "function decimals() view returns (uint8)",
+];
+const shortAddr = (a) => (a ? `${a.slice(0, 6)}…${a.slice(-4)}` : "");
+const WalletCtx = React.createContext(null);
+function useWalletState() {
+  const [address, setAddress] = useState(null);
+  const [balance, setBalance] = useState(null); // $MCLAW number, or null if unknown
+  const [connecting, setConnecting] = useState(false);
+  const [error, setError] = useState(null);
+  const readBalance = React.useCallback(async (addr) => {
+    if (!addr || !MCLAW_TOKEN_ADDRESS || !window.ethereum) return;
+    try {
+      const provider = new BrowserProvider(window.ethereum);
+      const erc20 = new Contract(MCLAW_TOKEN_ADDRESS, ERC20_ABI, provider);
+      const [raw, dec] = await Promise.all([erc20.balanceOf(addr), erc20.decimals()]);
+      setBalance(Number(formatUnits(raw, dec)));
+    } catch { /* token not deployed on this chain / call failed — leave balance unknown */ }
+  }, []);
+  const connect = React.useCallback(async () => {
+    if (!window.ethereum) { setError("No Ethereum wallet found — install MetaMask to connect."); return; }
+    setConnecting(true); setError(null);
+    try {
+      const provider = new BrowserProvider(window.ethereum);
+      const accs = await provider.send("eth_requestAccounts", []);
+      const addr = accs && accs[0];
+      setAddress(addr || null);
+      if (addr) readBalance(addr);
+    } catch (e) { setError(e?.shortMessage || e?.message || "Connection rejected"); }
+    finally { setConnecting(false); }
+  }, [readBalance]);
+  const disconnect = React.useCallback(() => { setAddress(null); setBalance(null); setError(null); }, []);
+  useEffect(() => {
+    if (!window.ethereum?.on) return;
+    const onAcc = (accs) => { const a = accs && accs[0]; setAddress(a || null); if (a) readBalance(a); else setBalance(null); };
+    window.ethereum.on("accountsChanged", onAcc);
+    return () => window.ethereum.removeListener?.("accountsChanged", onAcc);
+  }, [readBalance]);
+  return { address, balance, connecting, error, connect, disconnect, hasToken: !!MCLAW_TOKEN_ADDRESS };
+}
+const useWallet = () => React.useContext(WalletCtx) || {};
+function WalletProvider({ children }) {
+  return <WalletCtx.Provider value={useWalletState()}>{children}</WalletCtx.Provider>;
+}
+function WalletButton() {
+  const w = useWallet();
+  if (!w.connect) return null;
+  if (w.address) {
+    return (
+      <button className="ab-wallet on" title={`${w.address}${w.balance != null ? ` · ${w.balance} $MCLAW` : ""} — click to disconnect`} onClick={w.disconnect}>
+        <Wallet size={14} />{shortAddr(w.address)}{w.balance != null ? ` · ${Math.round(w.balance)}` : ""}
+      </button>
+    );
+  }
+  return (
+    <button className="ab-wallet" onClick={w.connect} disabled={w.connecting} title={w.error || "Connect your wallet"}>
+      <Wallet size={14} />{w.connecting ? "Connecting…" : "Connect wallet"}
+    </button>
+  );
+}
+// Pre-hand-off balance check shown inside the live-task steps.
+function WalletStakeNote({ pay }) {
+  const w = useWallet();
+  if (!w.connect) return null;
+  if (!w.address) return <button className="tm-wallet-connect" onClick={w.connect}><Wallet size={13} /> {w.connecting ? "Connecting…" : "Connect wallet to check your $MCLAW balance"}</button>;
+  if (w.balance == null) return <p className="tm-wallet-note"><Wallet size={13} /> Wallet {shortAddr(w.address)} connected{w.hasToken ? "" : " (set $MCLAW token to show balance)"}.</p>;
+  const short = w.balance < pay;
+  return <p className={`tm-wallet-note ${short ? "warn" : "ok"}`}><Wallet size={13} /> Balance {Math.round(w.balance)} $MCLAW — {short ? `may not cover the ${pay} stake` : `enough for the ${pay} stake`}.</p>;
+}
 function weiToMclaw(wei) {
   if (wei == null || wei === "") return 0;
   try { return Number(BigInt(String(wei).trim())) / 1e18; }
   catch { const n = Number(wei); return Number.isFinite(n) ? n : 0; }
+}
+// Relative deadline label, e.g. "due in 3d" / "due 5h" / "overdue". Null when
+// the task has no deadline (most demo tasks).
+function fmtDeadline(deadline) {
+  if (!deadline) return null;
+  const ts = Date.parse(deadline);
+  if (!Number.isFinite(ts)) return null;
+  const ms = ts - Date.now();
+  if (ms <= 0) return { label: "overdue", urgent: true };
+  const h = ms / 3.6e6;
+  if (h < 1) return { label: `due ${Math.max(1, Math.round(ms / 6e4))}m`, urgent: true };
+  if (h < 24) return { label: `due ${Math.round(h)}h`, urgent: h < 6 };
+  return { label: `due ${Math.round(h / 24)}d`, urgent: false };
 }
 // Pick a themed stock-image keyword from the task's words so live cards aren't
 // just gradients. Falls back to a generic work image.
@@ -40,8 +148,14 @@ function guessImg(text) {
 }
 function normalizeLiveTask(t) {
   const status = String(t.status || "new");
+  const gross = Math.round(weiToMclaw(t.escrowAmount ?? t.escrow_amount ?? 0) * 100) / 100;
+  const feePercent = t.feePercent ?? t.fee_percent;
+  const fee = Number(feePercent);
+  // Net $MCLAW the human keeps after McClaw's platform fee (gross if unknown).
+  const payout = Number.isFinite(fee) && fee > 0 ? Math.round(gross * (1 - fee / 100) * 100) / 100 : gross;
   return {
     id: String(t.id),
+    mcId: String(t.id), // the canonical McClaw task id (used for deep-links + status polling)
     title: t.title || "Untitled task",
     agent: t.agentName || t.agent_name || t.agentUsername || t.agent_username || t.agentId || t.agent_id || "agent",
     verified: !!(t.agentIsVerified || t.agentIsXVerified) || /fund|active|approved|released/i.test(status),
@@ -50,7 +164,10 @@ function normalizeLiveTask(t) {
     // sensible defaults so scoring, filters and cards still render.
     location: "Remote", remote: true, skills: [],
     minYears: 0, minReputation: 0, schedule: "async", timeCommitmentHours: 1,
-    pay: Math.round(weiToMclaw(t.escrowAmount ?? t.escrow_amount ?? 0) * 100) / 100,
+    pay: gross,
+    payout, // net after platform fee
+    feePercent: Number.isFinite(fee) ? fee : undefined,
+    deadline: t.deadline || t.due || t.expires_at || null,
     posted: "new", source: "mcclaw", mcStatus: status,
     img: guessImg((t.title || "") + " " + (t.description || t.desc || "")),
   };
@@ -428,7 +545,7 @@ function imgFallback(task, w, h) {
   };
 }
 
-function TaskModal({ task, profile, isApplied, onApply, onClose }) {
+function TaskModal({ task, profile, isApplied, isPending, cs = { state: "idle" }, onApply, onConfirmStake, onUnapply, onClose }) {
   useEffect(() => {
     const onKey = (e) => { if (e.key === "Escape") onClose(); };
     window.addEventListener("keydown", onKey); document.body.style.overflow = "hidden";
@@ -466,9 +583,11 @@ function TaskModal({ task, profile, isApplied, onApply, onClose }) {
           ) : (
             <>
               <div className="tm-stats">
-                <div><Coins size={15} /><b>{task.pay} $MCLAW</b><span>Pay</span></div>
+                <div><Coins size={15} /><b>{task.payout != null && task.payout !== task.pay ? `${task.payout} net` : `${task.pay}`} $MCLAW</b><span>{task.feePercent ? `Pay · ${task.feePercent}% fee` : "Pay"}</span></div>
                 <div>{mode === "remote" ? <Wifi size={15} /> : mode === "hybrid" ? <Shuffle size={15} /> : <MapPin size={15} />}<b>{modeLabel}</b><span>Where</span></div>
-                <div><Clock size={15} /><b>{task.schedule}</b><span>Schedule</span></div>
+                {(() => { const d = fmtDeadline(task.deadline); return d
+                  ? <div><CalendarX size={15} /><b style={d.urgent ? { color: "#ff8a72" } : undefined}>{d.label}</b><span>Deadline</span></div>
+                  : <div><Clock size={15} /><b>{task.schedule}</b><span>Schedule</span></div>; })()}
                 <div><Briefcase size={15} /><b>~{task.timeCommitmentHours}h</b><span>Time</span></div>
               </div>
               <div className="tm-sec"><h4>About this task</h4><p>{task.desc}</p><p>{genAbout(task)}</p></div>
@@ -478,19 +597,44 @@ function TaskModal({ task, profile, isApplied, onApply, onClose }) {
                 {!task.verified && <p className="tm-caution"><ShieldAlert size={12} /> This agent isn't verified yet — review the terms carefully.</p>}
               </div>
               <div className="tm-sec"><h4>How you get paid</h4><p>{task.pay} $MCLAW is locked in escrow the moment you're hired. A validator confirms your result, then funds release straight to your wallet — usually within minutes.</p></div>
-              <button className={`tc-apply lg ${isApplied ? "done" : ""}`} disabled={isApplied} onClick={() => onApply(task.id)}>{isApplied ? <><Check size={15} /> Applied</> : "Apply via your agent"}</button>
-              {isApplied && task.source === "mcclaw" && (
-                <div className="tm-steps">
-                  <h4>Next: finish on McClaw</h4>
-                  <p>Your agent flagged this task. Applying is completed on McClaw, where the on-chain $MCLAW stake is signed by your own wallet.</p>
-                  <a className="tm-steps-link" href="https://mcclaw.io" target="_blank" rel="noopener noreferrer">Open mcclaw.io <ArrowRight size={14} /></a>
-                  <ol className="tm-steps-list">
-                    <li>On <b>mcclaw.io</b>, connect your wallet.</li>
-                    <li>Go to the <b>Tasks</b> section.</li>
-                    <li>Search for <b>“{task.title}”</b>.</li>
-                    <li>Open it and <b>stake $MCLAW to apply</b> — confirm in your wallet.</li>
-                  </ol>
+              {cs.state === "checking" ? (
+                <button className="tc-apply lg" disabled>Checking availability on McClaw…</button>
+              ) : cs.state === "unavailable" ? (
+                <div className="tm-gone">
+                  <b><CalendarX size={15} /> This gig is no longer open.</b>
+                  <p>Its status is now <b>{cs.status}</b> — it was likely taken or expired since the board loaded. Browse other available tasks.</p>
+                  <button className="tc-apply lg" onClick={() => onApply(task.id)}>Re-check availability</button>
                 </div>
+              ) : isApplied && task.source === "mcclaw" && isGoneStatus(task.mcStatus) ? (
+                <div className="tm-gone">
+                  <b><CalendarX size={15} /> This gig is no longer open.</b>
+                  <p>Its status changed to <b>{task.mcStatus}</b> after you applied — it expired or was cancelled on McClaw.</p>
+                  <button className="tm-unapply" onClick={() => { onUnapply(task.id); onClose(); }}>Withdraw application</button>
+                </div>
+              ) : !isApplied ? (
+                <button className="tc-apply lg" onClick={() => onApply(task.id)}>{task.source === "mcclaw" ? "Apply on McClaw" : "Apply via your agent"}</button>
+              ) : isPending ? (
+                <>
+                  <div className="tm-steps">
+                    <h4>Next: finish on McClaw</h4>
+                    <p>Applying to a live task is an on-chain $MCLAW stake you sign with your own wallet — McMatcher can't submit it for you. Complete it on McClaw, then mark it done here.</p>
+                    <a className="tm-steps-link" href={taskUrl(task)} target="_blank" rel="noopener noreferrer">Open this gig on McClaw <ArrowRight size={14} /></a>
+                    <ol className="tm-steps-list">
+                      <li>Connect your wallet on McClaw.</li>
+                      <li><b>Stake $MCLAW to apply</b> — confirm the transaction in your wallet.</li>
+                      <li>Come back and mark it done below.</li>
+                    </ol>
+                    <WalletStakeNote pay={task.pay} />
+                    <button className="tc-apply lg" onClick={() => onConfirmStake(task.id)}><Check size={15} /> I've applied on McClaw — mark done</button>
+                  </div>
+                  <button className="tm-unapply" onClick={() => { onUnapply(task.id); onClose(); }}>Cancel application</button>
+                </>
+              ) : (
+                <>
+                  <button className="tc-apply lg done" disabled><Check size={15} /> Applied</button>
+                  {task.source === "mcclaw" && <p className="tm-staked"><Check size={13} /> Applied on McClaw — your application is in.</p>}
+                  <button className="tm-unapply" onClick={() => { onUnapply(task.id); onClose(); }}>Withdraw application</button>
+                </>
               )}
             </>
           )}
@@ -499,13 +643,18 @@ function TaskModal({ task, profile, isApplied, onApply, onClose }) {
     </div>
   );
 }
-function TaskCard({ task, profile, applied, onApply, tier }) {
+function TaskCard({ task, profile, applied, onApply, onUnapply, staked, onConfirmStake, applyStatus, tier }) {
+  const cs = applyStatus ? applyStatus(task.id) : { state: "idle" };
   const refuse = isRefuse(task);
   const m = profile && !refuse ? scoreTask(profile, task) : null;
   const Icon = iconFor(task); const grad = GRADS[hash(task.id) % GRADS.length];
+  const isLive = task.source === "mcclaw";
   const isApplied = applied.includes(task.id);
+  // Live tasks sit in a "pending" hand-off state until the on-chain stake is confirmed.
+  const isPending = isApplied && isLive && !(staked && staked[task.id]);
   const kw = TASK_IMG[task.id] || task.img;
   const [open, setOpen] = useState(false);
+  const [hovApplied, setHovApplied] = useState(false);
   return (
     <>
     <div className={`tc clickable ${refuse ? "refuse" : ""}`} onClick={() => setOpen(true)} role="button" tabIndex={0} onKeyDown={(e) => { if (e.key === "Enter") setOpen(true); }}>
@@ -526,19 +675,42 @@ function TaskCard({ task, profile, applied, onApply, tier }) {
         ) : (
           <>
             <div className="tc-meta">
-              <span><Coins size={11} />{task.pay}</span>
+              <span title={task.feePercent ? `${task.pay} gross · ${task.feePercent}% fee` : undefined}><Coins size={11} />{task.payout != null && task.payout !== task.pay ? `${task.payout} net` : task.pay}</span>
               <span>{modeOf(task) === "remote" ? <><Wifi size={11} />Remote</> : modeOf(task) === "hybrid" ? <><Shuffle size={11} />Hybrid · {task.location}</> : <><MapPin size={11} />{task.location}</>}</span>
               <span><Clock size={11} />{task.schedule}</span>
+              {(() => { const d = fmtDeadline(task.deadline); return d ? <span className={d.urgent ? "tc-due urgent" : "tc-due"}><CalendarX size={11} />{d.label}</span> : null; })()}
             </div>
             {m && m.gated && <div className="tc-gate">Needs reputation {task.minReputation} (you: {profile.reputation})</div>}
-            <button className={`tc-apply ${isApplied ? "done" : ""}`} disabled={isApplied} onClick={(e) => { e.stopPropagation(); onApply(task.id); if (task.source === "mcclaw") setOpen(true); }}>
-              {isApplied ? <><Check size={14} /> Applied</> : "Apply via your agent"}
-            </button>
+            {cs.state === "checking" ? (
+              <button className="tc-apply" disabled>Checking availability…</button>
+            ) : cs.state === "unavailable" ? (
+              <button className="tc-apply gone" title={`Status: ${cs.status}. Tap to re-check.`} onClick={(e) => { e.stopPropagation(); onApply(task.id); }}>
+                <CalendarX size={14} /> No longer available
+              </button>
+            ) : isApplied && isLive && isGoneStatus(task.mcStatus) ? (
+              <button className="tc-apply gone" title="This gig expired or was cancelled. Tap to withdraw." onClick={(e) => { e.stopPropagation(); onUnapply(task.id); }}>
+                <CalendarX size={14} /> No longer available
+              </button>
+            ) : !isApplied ? (
+              <button className="tc-apply" onClick={async (e) => { e.stopPropagation(); const ok = await onApply(task.id); if (ok && isLive) setOpen(true); }}>
+                {isLive ? "Apply on McClaw" : "Apply via your agent"}
+              </button>
+            ) : isPending ? (
+              <button className="tc-apply pending" onClick={(e) => { e.stopPropagation(); setOpen(true); }}>
+                <ArrowRight size={14} /> Finish on McClaw
+              </button>
+            ) : (
+              <button className="tc-apply done"
+                onMouseEnter={() => setHovApplied(true)} onMouseLeave={() => setHovApplied(false)}
+                onClick={(e) => { e.stopPropagation(); onUnapply(task.id); setHovApplied(false); }}>
+                {hovApplied ? <><X size={14} /> Unapply</> : <><Check size={14} /> Applied</>}
+              </button>
+            )}
           </>
         )}
       </div>
     </div>
-    {open && <TaskModal task={task} profile={profile} isApplied={isApplied} onApply={(id) => { onApply(id); }} onClose={() => setOpen(false)} />}
+    {open && <TaskModal task={task} profile={profile} isApplied={isApplied} isPending={isPending} cs={cs} onApply={onApply} onConfirmStake={onConfirmStake} onUnapply={onUnapply} onClose={() => setOpen(false)} />}
     </>
   );
 }
@@ -587,7 +759,7 @@ function fitsSchedule(task, profile) {
   }
   return true;
 }
-function Suggested({ tasks, profile, applied, onApply, goProfile, onQuiz }) {
+function Suggested({ tasks, profile, applied, onApply, onUnapply, staked, onConfirmStake, applyStatus, goProfile, onQuiz }) {
   if (!profile) return <div className="empty">Take a 2-minute quiz and your agent starts matching you right away. <button className="link" onClick={onQuiz}>Take the quiz →</button> <span className="empty-or">or</span> <button className="link" onClick={goProfile}>build a full profile</button></div>;
   const scored = tasks.filter((t) => !isRefuse(t)).map((t) => ({ ...t, m: scoreTask(profile, t) }));
   const buckets = { likely: [], reach: [], stretch: [] };
@@ -604,7 +776,7 @@ function Suggested({ tasks, profile, applied, onApply, goProfile, onQuiz }) {
             <span className="tier-count">{buckets[tier.key].length}</span>
           </div>
           <div className="grid">
-            {buckets[tier.key].map((t) => <TaskCard key={t.id} task={t} profile={profile} applied={applied} onApply={onApply} tier={tier} />)}
+            {buckets[tier.key].map((t) => <TaskCard key={t.id} task={t} profile={profile} applied={applied} onApply={onApply} onUnapply={onUnapply} staked={staked} onConfirmStake={onConfirmStake} applyStatus={applyStatus} tier={tier} />)}
           </div>
         </section>
       ))}
@@ -617,7 +789,7 @@ const DIFF_FILTERS = [["all", "All", null], ["easy", "Easy to get", TrendingUp],
 const SCHED_SEGS = [["any", "Any schedule", null], ["fits", "Fits my schedule", CalendarCheck], ["nofit", "Doesn't fit", CalendarX]];
 const MODE_FILTERS = [["all", "All", null], ["onsite", "In person", MapPin], ["hybrid", "Hybrid", Shuffle], ["remote", "Remote", Wifi]];
 const SEARCH_SAMPLES = ["photography", "writing", "spanish", "voice", "verify", "notary"];
-function AllAvailable({ tasks, profile, applied, onApply }) {
+function AllAvailable({ tasks, profile, applied, onApply, onUnapply, staked, onConfirmStake, applyStatus }) {
   const [q, setQ] = useState("");
   const [diff, setDiff] = useState("all");
   const [sched, setSched] = useState("any");
@@ -710,19 +882,20 @@ function AllAvailable({ tasks, profile, applied, onApply }) {
       </div>
       {list.length === 0
         ? <div className="empty">No tasks match these filters. Try another.</div>
-        : <div className="grid">{list.map((t) => <TaskCard key={t.id} task={t} profile={profile} applied={applied} onApply={onApply} tier={isRefuse(t) ? null : difficultyOf(t, profile)} />)}</div>}
+        : <div className="grid">{list.map((t) => <TaskCard key={t.id} task={t} profile={profile} applied={applied} onApply={onApply} onUnapply={onUnapply} staked={staked} onConfirmStake={onConfirmStake} applyStatus={applyStatus} tier={isRefuse(t) ? null : difficultyOf(t, profile)} />)}</div>}
     </div>
   );
 }
 
 /* ===================== Applied ===================== */
 const APP_ST = { hired: { label: "Hired", c: "#2fd286" }, reviewing: { label: "Reviewing", c: "#9bd0ff" } };
-function Applied({ tasks, applied, profile, jobStatus, onApply }) {
+function Applied({ tasks, applied, profile, jobStatus, staked, onConfirmStake, onUnapply, applyStatus }) {
   const [openId, setOpenId] = useState(null);
   const list = tasks.filter((t) => applied.includes(t.id));
   if (!list.length) return <div className="empty">No applications yet. Apply from <b>Suggested</b> or <b>All available</b>, and your agent negotiates on your behalf.</div>;
-  const stOf = (t) => JOB_STATUS[jobKeyFor(t, jobStatus)];
-  const hired = list.filter((t) => ["in_progress", "submitted", "approved", "paid"].includes(jobKeyFor(t, jobStatus))).length;
+  const isPending = (t) => t.source === "mcclaw" && !(staked && staked[t.id]);
+  const stOf = (t) => isGoneStatus(t.mcStatus) ? { label: "No longer available", c: "#ff8a72" } : isPending(t) ? { label: "Action needed on McClaw", c: "#ff8a72" } : JOB_STATUS[jobKeyFor(t, jobStatus)];
+  const hired = list.filter((t) => !isPending(t) && ["in_progress", "submitted", "approved", "paid"].includes(jobKeyFor(t, jobStatus))).length;
   const openTask = tasks.find((t) => t.id === openId);
   return (
     <div className="db">
@@ -742,7 +915,7 @@ function Applied({ tasks, applied, profile, jobStatus, onApply }) {
             <span className="db-mut">{t.posted === "new" ? "live" : `${t.posted} ago`}</span>
           </div>); })}
       </div>
-      {openTask && <TaskModal task={openTask} profile={profile} isApplied={true} onApply={() => {}} onClose={() => setOpenId(null)} />}
+      {openTask && <TaskModal task={openTask} profile={profile} isApplied={true} isPending={isPending(openTask)} cs={applyStatus ? applyStatus(openTask.id) : { state: "idle" }} onApply={() => {}} onConfirmStake={onConfirmStake} onUnapply={onUnapply} onClose={() => setOpenId(null)} />}
     </div>
   );
 }
@@ -832,6 +1005,10 @@ const JOB_STATUS = {
 };
 // Map McClaw's on-chain task lifecycle onto the app's status display.
 const MC_TO_JOB = { new: "open", funded: "open", active: "in_progress", submitted: "submitted", validating: "submitted", approved: "approved", released: "paid", rejected: "rejected", disputed: "disputed", expired: "closed", removed: "closed", cancelled: "closed" };
+// A live task in one of these states can no longer be applied to.
+const isGoneStatus = (s) => /expired|removed|cancelled/i.test(String(s || ""));
+// Terminal states we stop polling once a task reaches them.
+const isTerminalStatus = (s) => /expired|removed|cancelled|released|rejected/i.test(String(s || ""));
 function jobKeyFor(task, jobStatus) {
   if (!task) return "in_progress";
   if (task.source === "mcclaw") return MC_TO_JOB[String(task.mcStatus || "").toLowerCase()] || "open";
@@ -1093,7 +1270,26 @@ const STYLE = `
 .tab:hover{ color:var(--txt); }
 .tab.on{ color:var(--txt); }
 .tab.on::after{ content:''; position:absolute; left:14px; right:14px; bottom:0; height:3px; background:var(--em); border-radius:3px; }
-.ab-prof{ margin-left:auto; font-family:'JetBrains Mono',monospace; font-size:12px; color:var(--mut); }
+.ab-prof{ margin-left:14px; font-family:'JetBrains Mono',monospace; font-size:12px; color:var(--mut); }
+.ab-live{ margin-left:auto; display:inline-flex; align-items:center; gap:7px; font-family:'JetBrains Mono',monospace; font-size:11px; letter-spacing:.5px; font-weight:700; padding:6px 11px; border-radius:999px; border:1px solid var(--line); background:transparent; cursor:pointer; flex:none; }
+.ab-live .ab-dot{ width:7px; height:7px; border-radius:50%; background:currentColor; flex:none; }
+.ab-live.on{ color:#2fd286; border-color:#1e5a3d; }
+.ab-live.on .ab-dot{ box-shadow:0 0 0 3px rgba(47,210,134,.18); animation:abpulse 2s ease-in-out infinite; }
+.ab-live.off{ color:#ffb27a; border-color:#5a4416; }
+.ab-live.off:hover{ background:#2a1f0e; }
+.ab-live.loading{ color:var(--mut); cursor:default; }
+@keyframes abpulse{ 0%,100%{ opacity:1; } 50%{ opacity:.35; } }
+.tc-due{ color:#ffb27a; }
+.tc-due.urgent{ color:#ff8a72; font-weight:700; }
+.ab-wallet{ margin-left:12px; display:inline-flex; align-items:center; gap:6px; font-family:'JetBrains Mono',monospace; font-size:11px; font-weight:700; padding:7px 11px; border-radius:9px; border:1px solid var(--line); background:transparent; color:var(--mut); cursor:pointer; flex:none; }
+.ab-wallet:hover{ color:var(--txt); border-color:#2b5141; }
+.ab-wallet.on{ color:var(--em); border-color:#1e5a3d; }
+.ab-wallet:disabled{ opacity:.6; cursor:default; }
+.tm-wallet-note{ display:flex; align-items:center; gap:7px; margin:12px 0 0; font-size:12.5px; color:var(--mut); font-family:'JetBrains Mono',monospace; }
+.tm-wallet-note.ok{ color:var(--em); }
+.tm-wallet-note.warn{ color:#ff8a72; }
+.tm-wallet-connect{ display:flex; align-items:center; justify-content:center; gap:7px; width:100%; margin-top:12px; padding:10px; border-radius:9px; border:1px dashed #2b5141; background:transparent; color:var(--em); font-size:12.5px; font-weight:700; cursor:pointer; }
+.tm-wallet-connect:hover{ background:#0f2419; }
 .fgroup-pay{ gap:16px; }
 .pay-val{ font-family:'JetBrains Mono',monospace; font-size:13px; color:var(--em); min-width:120px; text-align:right; flex:none; }
 .ab-gear{ margin-left:16px; width:34px; height:34px; border-radius:9px; background:transparent; border:1px solid var(--line); color:var(--mut); display:grid; place-items:center; cursor:pointer; flex:none; }
@@ -1155,7 +1351,18 @@ const STYLE = `
 .tc-flag{ font-size:12px; color:var(--red); margin-top:8px; font-weight:600; }
 .tc-apply{ width:100%; background:var(--em); color:#06100b; border:none; border-radius:9px; padding:9px; font-weight:800; font-size:13px; cursor:pointer; display:flex; align-items:center; justify-content:center; gap:6px; }
 .tc-apply:hover{ background:#4ce39a; }
-.tc-apply.done{ background:var(--bg2); color:var(--em); border:1px solid var(--line); cursor:default; }
+.tc-apply.done{ background:var(--bg2); color:var(--em); border:1px solid var(--line); cursor:pointer; }
+.tc-apply.done:hover{ background:#2a1512; color:#ff8a72; border-color:#5a241c; }
+.tc-apply.pending{ background:#2a1f0e; color:#ffd27a; border:1px solid #5a4416; }
+.tc-apply.pending:hover{ background:#352713; }
+.tc-apply.gone{ background:#2a1512; color:#ff8a72; border:1px solid #5a241c; }
+.tc-apply.gone:hover{ background:#351a16; }
+.tm-gone{ margin-top:22px; background:#2a1512; border:1px solid #5a241c; border-radius:11px; padding:16px; }
+.tm-gone b{ display:flex; align-items:center; gap:7px; color:#ff8a72; font-size:14px; }
+.tm-gone p{ color:var(--mut); font-size:13px; margin:8px 0 14px; }
+.tm-unapply{ width:100%; margin-top:10px; background:transparent; color:#ff8a72; border:1px solid #5a241c; border-radius:9px; padding:10px; font-weight:700; font-size:13px; cursor:pointer; }
+.tm-unapply:hover{ background:#2a1512; }
+.tm-staked{ display:flex; align-items:center; justify-content:center; gap:6px; margin-top:10px; color:var(--em); font-size:13px; font-weight:600; }
 
 /* tier sections */
 .tier-sec{ margin-bottom:30px; }
@@ -1637,38 +1844,113 @@ export default function McMatcherProduct() {
   const [profile, setProfile] = useState(null);
   const [applied, setApplied] = useState(["t1", "t3"]);
   const [jobStatus, setJobStatus] = useState({ t1: "in_progress", t3: "submitted" });
+  // Live McClaw tasks: applying is an on-chain $MCLAW stake the user signs on
+  // mcclaw.io — we can't do it for them. `staked[id]` flips true once the user
+  // confirms they've completed that hand-off. Demo tasks skip this entirely.
+  const [staked, setStaked] = useState({});
+  // Transient apply-flow state: ids mid availability-check, and ids found closed.
+  const [checking, setChecking] = useState(() => new Set());
+  const [unavailable, setUnavailable] = useState({});
+  const applyStatus = (id) => checking.has(id) ? { state: "checking" } : unavailable[id] ? { state: "unavailable", ...unavailable[id] } : { state: "idle" };
   const [tasks, setTasks] = useState(TASKS);
   const [live, setLive] = useState(false);
-  useEffect(() => {
+  const [loadingLive, setLoadingLive] = useState(true);
+  const [liveError, setLiveError] = useState(null);
+  // Load the live McClaw board. Falls back to demo TASKS on failure/empty, but
+  // surfaces that via `live`/`liveError` so the header can show an honest badge.
+  const loadLive = React.useCallback(() => {
     let alive = true;
+    setLoadingLive(true); setLiveError(null);
     fetchLiveTasks()
       .then((list) => {
-        if (alive && list && list.length) {
+        if (!alive) return;
+        if (list && list.length) {
           setTasks(list); setLive(true);
-          setApplied([]); setJobStatus({}); // sample demo state doesn't apply to live tasks
+          setApplied([]); setJobStatus({}); setStaked({}); // sample demo state doesn't apply to live tasks
+        } else {
+          setLive(false); setLiveError("empty"); // no key / empty board → demo data
         }
       })
-      .catch((e) => console.warn("McClaw live tasks unavailable:", e?.message));
+      .catch((e) => { if (alive) { setLive(false); setLiveError(e?.message || "unreachable"); } })
+      .finally(() => { if (alive) setLoadingLive(false); });
     return () => { alive = false; };
   }, []);
-  const onApply = (id) => {
+  useEffect(() => loadLive(), [loadLive]);
+  // Returns true once the task is added to `applied` (so the card can open the
+  // hand-off modal), false if we redirected to Profile or the task is gone.
+  const onApply = async (id) => {
     const task = tasks.find((t) => t.id === id);
     const isLive = task && task.source === "mcclaw";
     // Live task → no redirect; the task view shows an in-app "next steps" panel
     // with the McClaw link + instructions. No profile needed for this.
     if (!isLive && !profile) {
       setTab("profile");
-      return;
+      return false;
+    }
+    // Live tasks: verify the gig is still open server-side before sending the
+    // user off to stake. Catches tasks taken/expired since the board was loaded.
+    if (isLive) {
+      setUnavailable((u) => { if (!u[id]) return u; const n = { ...u }; delete n[id]; return n; });
+      setChecking((s) => { const n = new Set(s); n.add(id); return n; });
+      const v = await verifyTaskOpen(task.mcId || task.id);
+      setChecking((s) => { const n = new Set(s); n.delete(id); return n; });
+      // Only block on a *definitive* closed signal. `available:null` (network
+      // hiccup) or `reason:"no-key"` (demo) fall through and let the user proceed.
+      if (v && v.available === false && v.reason !== "no-key") {
+        setUnavailable((u) => ({ ...u, [id]: { status: v.status || v.reason || "closed" } }));
+        return false;
+      }
     }
     setApplied((a) => (a.includes(id) ? a : [...a, id]));
-    setJobStatus((s) => (s[id] ? s : { ...s, [id]: "in_progress" }));
+    // Demo tasks: the agent "applies" instantly. Live tasks stay pending until
+    // the user confirms the on-chain stake via onConfirmStake.
+    if (!isLive) setJobStatus((s) => (s[id] ? s : { ...s, [id]: "in_progress" }));
+    return true;
+  };
+  const onConfirmStake = (id) => {
+    setApplied((a) => (a.includes(id) ? a : [...a, id]));
+    setStaked((s) => ({ ...s, [id]: true }));
+  };
+  const onUnapply = (id) => {
+    setApplied((a) => a.filter((x) => x !== id));
+    setJobStatus((s) => { const n = { ...s }; delete n[id]; return n; });
+    setStaked((s) => { const n = { ...s }; delete n[id]; return n; });
   };
   const advance = (id, next) => setJobStatus((s) => ({ ...s, [id]: next }));
+
+  // --- Status reconciliation -------------------------------------------------
+  // After hand-off, the local `staked` flag is just the user's word. Poll the
+  // tasks they've applied to and refresh `mcStatus` from McClaw so the Applied /
+  // Working tabs reflect on-chain truth: a gig going `active` (someone hired) or
+  // `expired`/`cancelled` (gone) updates live without a page reload.
+  const tasksRef = useRef(tasks); tasksRef.current = tasks;
+  useEffect(() => {
+    if (!live || !applied.length) return;
+    let alive = true;
+    const tick = async () => {
+      const pending = applied
+        .map((id) => tasksRef.current.find((t) => t.id === id))
+        .filter((t) => t && t.source === "mcclaw" && !isTerminalStatus(t.mcStatus));
+      for (const t of pending) {
+        const v = await verifyTaskOpen(t.mcId || t.id);
+        if (!alive) return;
+        const status = v && (v.status || (v.available === false && v.reason !== "no-key" ? "removed" : null));
+        if (status && status !== t.mcStatus) {
+          setTasks((prev) => prev.map((x) => (x.id === t.id ? { ...x, mcStatus: status } : x)));
+        }
+      }
+    };
+    const iv = setInterval(tick, 25000);
+    tick();
+    return () => { alive = false; clearInterval(iv); };
+  }, [applied, live]);
+
   const activeCount = applied.filter((id) => !["paid", "closed", "rejected", "approved"].includes(jobKeyFor(tasks.find((x) => x.id === id), jobStatus))).length;
   const enter = (t) => { setTab(t); setScreen("app"); };
   const finishQuiz = (p) => { setProfile(p); enter("suggested"); };
 
   return (
+    <WalletProvider>
     <div className="root">
       <style>{STYLE}</style>
       {screen === "landing" ? (
@@ -1684,19 +1966,27 @@ export default function McMatcherProduct() {
                 {tab === k && <span className="tmk">›</span>}{label.toUpperCase()}{k === "applied" && applied.length ? ` (${applied.length})` : ""}{k === "working" && activeCount ? ` (${activeCount})` : ""}
               </button>
             ))}
-            <div className="ab-prof">{live ? `● live · ${tasks.length} tasks · ` : ""}{profile ? `${profile.location} · ${profile.hoursPerWeek}h/wk · rep ${profile.reputation}` : "no profile"}</div>
+            <button
+              className={`ab-live ${live ? "on" : loadingLive ? "loading" : "off"}`}
+              title={live ? `Live McClaw board · ${tasks.length} gigs` : loadingLive ? "Connecting to McClaw…" : `Showing demo data${liveError && liveError !== "empty" ? ` — ${liveError}` : ""}. Click to retry.`}
+              onClick={() => !loadingLive && loadLive()}>
+              <span className="ab-dot" />{live ? `LIVE · ${tasks.length}` : loadingLive ? "CONNECTING…" : "DEMO · RETRY"}
+            </button>
+            <div className="ab-prof">{profile ? `${profile.location} · ${profile.hoursPerWeek}h/wk · rep ${profile.reputation}` : "no profile"}</div>
+            <WalletButton />
             <button className={`ab-gear ${tab === "settings" ? "on" : ""}`} title="Settings" onClick={() => setTab("settings")}><Settings size={17} /></button>
           </header>
           <main className="page">
-            {tab === "suggested" && <><h1 className="page-h">Suggested for you</h1><Suggested tasks={tasks} profile={profile} applied={applied} onApply={onApply} goProfile={() => setTab("profile")} onQuiz={() => setScreen("quiz")} /></>}
-            {tab === "all" && <><h1 className="page-h">All available</h1><AllAvailable tasks={tasks} profile={profile} applied={applied} onApply={onApply} /></>}
+            {tab === "suggested" && <><h1 className="page-h">Suggested for you</h1><Suggested tasks={tasks} profile={profile} applied={applied} onApply={onApply} onUnapply={onUnapply} staked={staked} onConfirmStake={onConfirmStake} applyStatus={applyStatus} goProfile={() => setTab("profile")} onQuiz={() => setScreen("quiz")} /></>}
+            {tab === "all" && <><h1 className="page-h">All available</h1><AllAvailable tasks={tasks} profile={profile} applied={applied} onApply={onApply} onUnapply={onUnapply} staked={staked} onConfirmStake={onConfirmStake} applyStatus={applyStatus} /></>}
             {tab === "working" && <><h1 className="page-h">Working on</h1><WorkingOn tasks={tasks} applied={applied} jobStatus={jobStatus} onAdvance={advance} /></>}
-            {tab === "applied" && <><h1 className="page-h">Applied</h1><Applied tasks={tasks} applied={applied} profile={profile} jobStatus={jobStatus} onApply={onApply} /></>}
+            {tab === "applied" && <><h1 className="page-h">Applied</h1><Applied tasks={tasks} applied={applied} profile={profile} jobStatus={jobStatus} staked={staked} onConfirmStake={onConfirmStake} onUnapply={onUnapply} applyStatus={applyStatus} /></>}
             {tab === "profile" && <ProfilePage profile={profile} onSave={setProfile} onQuiz={() => setScreen("quiz")} />}
             {tab === "settings" && <SettingsPage profile={profile} />}
           </main>
         </>
       )}
     </div>
+    </WalletProvider>
   );
 }
