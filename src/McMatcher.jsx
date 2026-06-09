@@ -1349,6 +1349,7 @@ const STYLE = `
 .tm-pros li svg{ color:var(--em); flex:none; margin-top:2px; }
 .tm-cons li svg{ color:#ff8a72; flex:none; margin-top:2px; }
 .sc-hint{ color:var(--mut); font-size:12px; line-height:1.5; margin:4px 2px 0; }
+.sc-hint.err{ color:#ff8a72; }
 .note.err{ color:#ff8a72; }
 .sortrow{ display:flex; align-items:center; gap:7px; flex-wrap:wrap; margin-top:10px; }
 .sort-lbl{ font-family:'JetBrains Mono',monospace; font-size:11px; text-transform:uppercase; letter-spacing:.5px; color:var(--mut); }
@@ -1843,6 +1844,7 @@ function Toggle({ on, onChange }) {
   return <button className={`tgl ${on ? "on" : ""}`} onClick={() => onChange(!on)} role="switch" aria-checked={on}><span className="tgl-knob" /></button>;
 }
 function SettingsPage({ profile, aiKey, onAiKey }) {
+  const w = useWallet();
   const [notif, setNotif] = useState({ matches: true, expiring: true, paid: true, digest: false });
   const [privacy, setPrivacy] = useState({ visible: true, showLoc: true });
   const [autoWithdraw, setAutoWithdraw] = useState(false);
@@ -1858,7 +1860,13 @@ function SettingsPage({ profile, aiKey, onAiKey }) {
       <div className="settings-grid">
       <section className="sc">
         <div className="sc-head"><Wallet size={16} /> Account &amp; wallet</div>
-        <div className="sc-row"><div><b>Connected wallet</b><span>0x8F3a…D71c · Base</span></div><button className="btn-ghost sm">Disconnect</button></div>
+        <div className="sc-row">
+          <div><b>Connected wallet</b><span>{w.address ? `${shortAddr(w.address)}${w.balance != null ? ` · ${Math.round(w.balance)} $MCLAW` : ""}` : "Not connected"}</span></div>
+          {w.address
+            ? <button className="btn-ghost sm" onClick={w.disconnect}>Disconnect</button>
+            : <button className="btn-ghost sm" onClick={w.connect} disabled={w.connecting}>{w.connecting ? "Connecting…" : "Connect"}</button>}
+        </div>
+        {w.error && <div className="sc-hint err">{w.error}</div>}
         <div className="sc-field"><label>Display name</label><input value={name} onChange={(e) => setName(e.target.value)} placeholder="How agents see you" /></div>
         <div className="sc-field"><label>Email for alerts</label><input value={email} onChange={(e) => setEmail(e.target.value)} placeholder="you@email.com" type="email" /></div>
       </section>
@@ -1929,6 +1937,7 @@ export default function McMatcherProduct() {
   const [aiScores, setAiScores] = useState(() => load(LS_AISCORES, {}));
   const [scoring, setScoring] = useState({ active: false, done: 0, total: 0 });
   const scoreAbort = useRef(null);
+  const aiScoresRef = useRef(aiScores); aiScoresRef.current = aiScores;
   useEffect(() => save(LS.anthropicKey, aiKey), [aiKey]);
   useEffect(() => save(LS_AISCORES, aiScores), [aiScores]);
   const [tasks, setTasks] = useState(TASKS);
@@ -1994,10 +2003,11 @@ export default function McMatcherProduct() {
   // --- AI scoring with Claude -----------------------------------------------
   // Score the current board against the candidate, streaming each result in as
   // it lands. Caps at MAX_LLM_JOBS so a huge board doesn't fan out unbounded.
-  const runScoring = React.useCallback(async () => {
+  const runScoring = React.useCallback(async (force = false) => {
     if (!aiKey || !profile || scoring.active) return;
     const jobs = tasks
       .filter((t) => !isRefuse(t))
+      .filter((t) => force || !aiScoresRef.current[t.id]) // auto-runs only fill the gaps
       .slice(0, MAX_LLM_JOBS)
       .map((t) => ({ ...t, description: t.desc, payNet: t.payout }));
     if (!jobs.length) return;
@@ -2023,6 +2033,16 @@ export default function McMatcherProduct() {
     }
   }, [aiKey, profile, tasks, scoring.active]);
   useEffect(() => () => scoreAbort.current?.abort(), []);
+  // Editing the profile invalidates existing scores (they were judged against the
+  // old resume/skills) — clear them so the auto-scorer re-runs against the new one.
+  const prevProfileRef = useRef(profile);
+  useEffect(() => {
+    if (prevProfileRef.current && profile && prevProfileRef.current !== profile) setAiScores({});
+    prevProfileRef.current = profile;
+  }, [profile]);
+  // Auto-score: whenever there's a key, a profile, and gigs without a score yet
+  // (fresh board, board refresh, or just-cleared scores), fill them in.
+  useEffect(() => { runScoring(false); }, [runScoring, aiScores]);
 
   const activeCount = applied.filter((id) => !["paid", "closed", "rejected", "approved"].includes(jobKeyFor(tasks.find((x) => x.id === id), jobStatus))).length;
   const enter = (t) => { setTab(t); setScreen("app"); };
@@ -2054,8 +2074,8 @@ export default function McMatcherProduct() {
             <button
               className={`ab-score ${scoring.active ? "active" : ""}`}
               disabled={scoring.active || !profile || !aiKey}
-              title={!aiKey ? "Add your Anthropic API key in Settings to score with Claude" : !profile ? "Set up your profile first" : "Score the board against your profile with Claude"}
-              onClick={runScoring}>
+              title={!aiKey ? "Add your Anthropic API key in Settings to score with Claude" : !profile ? "Set up your profile first" : "Re-score the whole board against your profile with Claude"}
+              onClick={() => runScoring(true)}>
               <Sparkles size={14} />{scoring.active ? `SCORING ${scoring.done}/${scoring.total}` : "SCORE WITH CLAUDE"}
             </button>
             <div className="ab-prof">{profile ? `${profile.location} · ${profile.hoursPerWeek}h/wk · rep ${profile.reputation}` : "no profile"}</div>
