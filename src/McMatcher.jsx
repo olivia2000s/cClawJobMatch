@@ -1,5 +1,9 @@
 import React, { useState, useMemo, useRef, useEffect } from "react";
 import { BrowserProvider, Contract, formatUnits } from "ethers";
+import { load, save } from "./lib/storage.js";
+import { LS, ENV_ANTHROPIC_KEY, DEFAULT_MODEL, MAX_LLM_JOBS } from "./config.js";
+import { scoreJobs } from "./lib/scorer.js";
+import { extractPdfText, isPdf } from "./lib/resume.js";
 import {
   Camera, Languages, Utensils, MessageCircle, Wrench, Mic, Stamp, PenLine, Briefcase,
   ShieldCheck, ShieldAlert, Bot, Search, MapPin, Wifi, Clock, Coins, Sparkles, Check,
@@ -17,6 +21,11 @@ const LIVE_TASKS_URL = import.meta.env.VITE_LIVE_TASKS_URL || "/api/tasks";
 // McClaw home. The site has no public per-task deep-link URL, so the hand-off
 // opens the homepage and instructs the user to search for the gig by title.
 const MCCLAW_HOME = import.meta.env.VITE_MCCLAW_URL || "https://mcclaw.io";
+// localStorage keys for app state not already covered by config.LS.
+const LS_APPLIED = "mcclaw.applied";
+const LS_JOBSTATUS = "mcclaw.jobStatus";
+const LS_STAKED = "mcclaw.staked";
+const LS_AISCORES = "mcclaw.aiScores";
 
 /* ===================== wallet (ethers) ===================== */
 // Optional: set VITE_MCLAW_TOKEN_ADDRESS to the $MCLAW ERC-20 to read balances.
@@ -529,7 +538,33 @@ function imgFallback(task, w, h) {
   };
 }
 
-function TaskModal({ task, profile, isApplied, isPending, onApply, onConfirmStake, onUnapply, onClose }) {
+// "Why you fit / what's missing" — Claude's rationale when scored, otherwise the
+// transparent breakdown from the deterministic matcher. Renders nothing without
+// a profile (no basis to judge fit).
+function MatchPanel({ m, ai }) {
+  if (!ai && !m) return null;
+  const matched = ai ? ai.matched_skills : m.matched;
+  const missing = ai ? ai.missing_skills : m.missing;
+  return (
+    <div className="tm-sec tm-match-panel">
+      <h4>{ai ? <><Sparkles size={14} /> Why Claude matched you</> : "Why you fit"}</h4>
+      {ai ? <p className="tm-rationale">{ai.rationale}</p>
+        : <p className="tm-rationale">{matched?.length ? `You match ${matched.length} of ${(matched.length + (missing?.length || 0))} required skills.` : "Your profile doesn't show the skills this gig asks for yet."}{m.gated ? " You're also below the reputation bar for now." : ""}</p>}
+      <div className="tm-fit">
+        {matched?.length > 0 && <div className="tm-fit-col"><span className="tm-fit-lbl have"><Check size={12} /> You have</span><div className="tm-skills">{matched.map((s) => <span key={s} className="tm-skill have">{s}</span>)}</div></div>}
+        {missing?.length > 0 && <div className="tm-fit-col"><span className="tm-fit-lbl need"><X size={12} /> You'd need</span><div className="tm-skills">{missing.map((s) => <span key={s} className="tm-skill need">{s}</span>)}</div></div>}
+      </div>
+      {ai && (ai.pros?.length > 0 || ai.cons?.length > 0) && (
+        <div className="tm-procon">
+          {ai.pros?.length > 0 && <ul className="tm-pros">{ai.pros.map((p, i) => <li key={i}><Check size={12} /> {p}</li>)}</ul>}
+          {ai.cons?.length > 0 && <ul className="tm-cons">{ai.cons.map((c, i) => <li key={i}><ShieldAlert size={12} /> {c}</li>)}</ul>}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function TaskModal({ task, profile, isApplied, isPending, ai, onApply, onConfirmStake, onUnapply, onClose }) {
   useEffect(() => {
     const onKey = (e) => { if (e.key === "Escape") onClose(); };
     window.addEventListener("keydown", onKey); document.body.style.overflow = "hidden";
@@ -556,7 +591,7 @@ function TaskModal({ task, profile, isApplied, isPending, onApply, onConfirmStak
           <div className="tm-top">
             <div><h2 className="tm-title">{task.title}</h2>
               <div className="tm-agent">{task.verified ? <ShieldCheck size={13} color="#2fd286" /> : <ShieldAlert size={13} color="#ff8a72" />} {task.agent} · {TASK_CAT[task.id]}</div></div>
-            {m && <span className="tm-match">{m.total}% match</span>}
+            {(ai || m) && <span className={`tm-match ${ai ? "ai" : ""}`}>{ai ? <><Sparkles size={11} /> {ai.match_score}% · {ai.recommendation}</> : `${m.total}% match`}</span>}
           </div>
           {refuse ? (
             <div className="tm-warn">
@@ -575,6 +610,7 @@ function TaskModal({ task, profile, isApplied, isPending, onApply, onConfirmStak
                 <div><Briefcase size={15} /><b>~{task.timeCommitmentHours}h</b><span>Time</span></div>
               </div>
               <div className="tm-sec"><h4>About this task</h4><p>{task.desc}</p><p>{genAbout(task)}</p></div>
+              <MatchPanel m={m} ai={ai} />
               <div className="tm-sec"><h4>What you'll need</h4>
                 <div className="tm-skills">{task.skills.map((s) => <span key={s} className="tm-skill">{s}</span>)}</div>
                 {(task.minReputation > 0 || task.minYears > 0) && <p className="tm-req">{task.minReputation > 0 ? `Reputation ${task.minReputation}+` : ""}{task.minReputation > 0 && task.minYears > 0 ? " · " : ""}{task.minYears > 0 ? `${task.minYears}+ yrs experience` : ""}{m && m.gated ? " — you don't meet the bar yet" : ""}</p>}
@@ -614,9 +650,10 @@ function TaskModal({ task, profile, isApplied, isPending, onApply, onConfirmStak
     </div>
   );
 }
-function TaskCard({ task, profile, applied, onApply, onUnapply, staked, onConfirmStake, tier }) {
+function TaskCard({ task, profile, applied, onApply, onUnapply, staked, onConfirmStake, ai, tier }) {
   const refuse = isRefuse(task);
   const m = profile && !refuse ? scoreTask(profile, task) : null;
+  const pct = ai ? ai.match_score : m ? m.total : null;
   const Icon = iconFor(task); const grad = GRADS[hash(task.id) % GRADS.length];
   const isLive = task.source === "mcclaw";
   const isApplied = applied.includes(task.id);
@@ -633,7 +670,7 @@ function TaskCard({ task, profile, applied, onApply, onUnapply, staked, onConfir
         {!refuse && <div className="tc-tint" style={{ backgroundImage: grad }} />}
         {!refuse && <div className="tc-scrim" />}
         {refuse ? <ShieldAlert size={30} color="#ff8a72" /> : <Icon size={26} color="#fff" className="tc-ic" />}
-        {m && <span className="tc-mp">{m.total}%</span>}
+        {pct != null && <span className={`tc-mp ${ai ? "ai" : ""}`} title={ai ? "Scored by Claude" : undefined}>{ai && <Sparkles size={10} />}{pct}%</span>}
         {tier && <span className={`tc-tier tier-${tier.key}`}>{tier.label}</span>}
       </div>
       <div className="tc-body">
@@ -650,6 +687,7 @@ function TaskCard({ task, profile, applied, onApply, onUnapply, staked, onConfir
               <span><Clock size={11} />{task.schedule}</span>
               {(() => { const d = fmtDeadline(task.deadline); return d ? <span className={d.urgent ? "tc-due urgent" : "tc-due"}><CalendarX size={11} />{d.label}</span> : null; })()}
             </div>
+            {ai && ai.one_liner && <div className="tc-ai"><Sparkles size={11} /> {ai.one_liner}</div>}
             {m && m.gated && <div className="tc-gate">Needs reputation {task.minReputation} (you: {profile.reputation})</div>}
             {!isApplied ? (
               <button className="tc-apply" onClick={(e) => { e.stopPropagation(); const ok = onApply(task.id); if (ok && isLive) setOpen(true); }}>
@@ -670,7 +708,7 @@ function TaskCard({ task, profile, applied, onApply, onUnapply, staked, onConfir
         )}
       </div>
     </div>
-    {open && <TaskModal task={task} profile={profile} isApplied={isApplied} isPending={isPending} onApply={onApply} onConfirmStake={onConfirmStake} onUnapply={onUnapply} onClose={() => setOpen(false)} />}
+    {open && <TaskModal task={task} profile={profile} isApplied={isApplied} isPending={isPending} ai={ai} onApply={onApply} onConfirmStake={onConfirmStake} onUnapply={onUnapply} onClose={() => setOpen(false)} />}
     </>
   );
 }
@@ -719,12 +757,20 @@ function fitsSchedule(task, profile) {
   }
   return true;
 }
-function Suggested({ tasks, profile, applied, onApply, onUnapply, staked, onConfirmStake, goProfile, onQuiz }) {
+function Suggested({ tasks, profile, applied, onApply, onUnapply, staked, onConfirmStake, aiScores, goProfile, onQuiz }) {
   if (!profile) return <div className="empty">Take a 2-minute quiz and your agent starts matching you right away. <button className="link" onClick={onQuiz}>Take the quiz →</button> <span className="empty-or">or</span> <button className="link" onClick={goProfile}>build a full profile</button></div>;
-  const scored = tasks.filter((t) => !isRefuse(t)).map((t) => ({ ...t, m: scoreTask(profile, t) }));
+  // When a Claude score exists for a task, it drives the tier + ordering;
+  // otherwise we fall back to the deterministic heuristic.
+  const scored = tasks.filter((t) => !isRefuse(t)).map((t) => {
+    const m = scoreTask(profile, t);
+    const ai = aiScores && aiScores[t.id];
+    const eff = ai ? ai.match_score : m.total;
+    const tier = ai ? (ai.recommendation === "strong" ? "likely" : ai.recommendation === "good" ? "reach" : "stretch") : tierOf(m);
+    return { ...t, m, eff, tierKey: tier };
+  });
   const buckets = { likely: [], reach: [], stretch: [] };
-  scored.forEach((t) => buckets[tierOf(t.m)].push(t));
-  Object.values(buckets).forEach((b) => b.sort((a, z) => z.m.total - a.m.total));
+  scored.forEach((t) => buckets[t.tierKey].push(t));
+  Object.values(buckets).forEach((b) => b.sort((a, z) => z.eff - a.eff));
   return (
     <div>
       {TIERS.map((tier) => buckets[tier.key].length > 0 && (
@@ -736,7 +782,7 @@ function Suggested({ tasks, profile, applied, onApply, onUnapply, staked, onConf
             <span className="tier-count">{buckets[tier.key].length}</span>
           </div>
           <div className="grid">
-            {buckets[tier.key].map((t) => <TaskCard key={t.id} task={t} profile={profile} applied={applied} onApply={onApply} onUnapply={onUnapply} staked={staked} onConfirmStake={onConfirmStake} tier={tier} />)}
+            {buckets[tier.key].map((t) => <TaskCard key={t.id} task={t} profile={profile} applied={applied} onApply={onApply} onUnapply={onUnapply} staked={staked} onConfirmStake={onConfirmStake} ai={aiScores && aiScores[t.id]} tier={tier} />)}
           </div>
         </section>
       ))}
@@ -749,12 +795,13 @@ const DIFF_FILTERS = [["all", "All", null], ["easy", "Easy to get", TrendingUp],
 const SCHED_SEGS = [["any", "Any schedule", null], ["fits", "Fits my schedule", CalendarCheck], ["nofit", "Doesn't fit", CalendarX]];
 const MODE_FILTERS = [["all", "All", null], ["onsite", "In person", MapPin], ["hybrid", "Hybrid", Shuffle], ["remote", "Remote", Wifi]];
 const SEARCH_SAMPLES = ["photography", "writing", "spanish", "voice", "verify", "notary"];
-function AllAvailable({ tasks, profile, applied, onApply, onUnapply, staked, onConfirmStake }) {
+function AllAvailable({ tasks, profile, applied, onApply, onUnapply, staked, onConfirmStake, aiScores }) {
   const [q, setQ] = useState("");
   const [diff, setDiff] = useState("all");
   const [sched, setSched] = useState("any");
   const [mode, setMode] = useState("all");
   const [pay, setPay] = useState(0);
+  const [sort, setSort] = useState("match");
   const [filtersOpen, setFiltersOpen] = useState(true);
   const [ph, setPh] = useState("");
   useEffect(() => {
@@ -789,6 +836,14 @@ function AllAvailable({ tasks, profile, applied, onApply, onUnapply, staked, onC
     }
     return true;
   });
+  // Sort the filtered board. Match uses the Claude score when present, else the
+  // heuristic; deadline pushes undated gigs to the end.
+  const matchOf = (t) => (aiScores && aiScores[t.id]) ? aiScores[t.id].match_score : (profile && !isRefuse(t) ? scoreTask(profile, t).total : -1);
+  const dl = (t) => { const v = t.deadline ? Date.parse(t.deadline) : NaN; return Number.isFinite(v) ? v : Infinity; };
+  list.sort((a, b) =>
+    sort === "pay" ? (b.payout ?? b.pay ?? 0) - (a.payout ?? a.pay ?? 0)
+    : sort === "deadline" ? dl(a) - dl(b)
+    : matchOf(b) - matchOf(a));
   return (
     <div>
       <div className="filterpanel">
@@ -797,6 +852,12 @@ function AllAvailable({ tasks, profile, applied, onApply, onUnapply, staked, onC
           <input placeholder={q ? "" : ph ? `Search "${ph}▍"` : "Search tasks, skills, agents…"} value={q} onChange={(e) => setQ(e.target.value)} />
           {q && <button className="s-clear" onClick={() => setQ("")}><X size={15} /></button>}
           <button className="s-mic" title="Voice search"><Mic size={16} /></button>
+        </div>
+        <div className="sortrow">
+          <span className="sort-lbl">Sort</span>
+          {[["match", "Best match"], ["pay", "Highest pay"], ["deadline", "Soonest deadline"]].map(([k, label]) => (
+            <button key={k} className={`sort-chip ${sort === k ? "on" : ""}`} onClick={() => setSort(k)}>{label}</button>
+          ))}
         </div>
         <div className="s-samples">
           <span className="ss-lbl">Try</span>
@@ -842,14 +903,14 @@ function AllAvailable({ tasks, profile, applied, onApply, onUnapply, staked, onC
       </div>
       {list.length === 0
         ? <div className="empty">No tasks match these filters. Try another.</div>
-        : <div className="grid">{list.map((t) => <TaskCard key={t.id} task={t} profile={profile} applied={applied} onApply={onApply} onUnapply={onUnapply} staked={staked} onConfirmStake={onConfirmStake} tier={isRefuse(t) ? null : difficultyOf(t, profile)} />)}</div>}
+        : <div className="grid">{list.map((t) => <TaskCard key={t.id} task={t} profile={profile} applied={applied} onApply={onApply} onUnapply={onUnapply} staked={staked} onConfirmStake={onConfirmStake} ai={aiScores && aiScores[t.id]} tier={isRefuse(t) ? null : difficultyOf(t, profile)} />)}</div>}
     </div>
   );
 }
 
 /* ===================== Applied ===================== */
 const APP_ST = { hired: { label: "Hired", c: "#2fd286" }, reviewing: { label: "Reviewing", c: "#9bd0ff" } };
-function Applied({ tasks, applied, profile, jobStatus, staked, onConfirmStake, onUnapply }) {
+function Applied({ tasks, applied, profile, jobStatus, staked, onConfirmStake, onUnapply, aiScores }) {
   const [openId, setOpenId] = useState(null);
   const list = tasks.filter((t) => applied.includes(t.id));
   if (!list.length) return <div className="empty">No applications yet. Apply from <b>Suggested</b> or <b>All available</b>, and your agent negotiates on your behalf.</div>;
@@ -875,7 +936,7 @@ function Applied({ tasks, applied, profile, jobStatus, staked, onConfirmStake, o
             <span className="db-mut">{t.posted === "new" ? "live" : `${t.posted} ago`}</span>
           </div>); })}
       </div>
-      {openTask && <TaskModal task={openTask} profile={profile} isApplied={true} isPending={isPending(openTask)} onApply={() => {}} onConfirmStake={onConfirmStake} onUnapply={onUnapply} onClose={() => setOpenId(null)} />}
+      {openTask && <TaskModal task={openTask} profile={profile} isApplied={true} isPending={isPending(openTask)} ai={aiScores && aiScores[openTask.id]} onApply={() => {}} onConfirmStake={onConfirmStake} onUnapply={onUnapply} onClose={() => setOpenId(null)} />}
     </div>
   );
 }
@@ -1013,12 +1074,29 @@ function ProfilePage({ profile, onSave, onQuiz }) {
   const [saved, setSaved] = useState(false);
   const [dirty, setDirty] = useState(false);
   const [projDraft, setProjDraft] = useState("");
+  const [pdfBusy, setPdfBusy] = useState(false);
+  const [pdfErr, setPdfErr] = useState(null);
   const set = (k, v) => { setF((x) => ({ ...x, [k]: v })); setSaved(false); setDirty(true); };
+  // Real PDF → text via pdf.js, then heuristic autofill. Falls back to just
+  // recording the filename for non-PDFs.
+  async function onResumePdf(file) {
+    if (!file) return;
+    if (!isPdf(file)) { set("fileName", file.name); return; }
+    setPdfBusy(true); setPdfErr(null);
+    try {
+      const text = await extractPdfText(file);
+      const p = parseResume(text);
+      setF((x) => ({ ...x, resumeText: text || x.resumeText, fileName: file.name, ...p }));
+      setParsed(true); setSaved(false); setDirty(true);
+    } catch (e) {
+      setPdfErr(e?.message || "Couldn't read that PDF — paste the text instead.");
+    } finally { setPdfBusy(false); }
+  }
   const toggle = (k, v) => set(k, (f[k] || []).includes(v) ? f[k].filter((x) => x !== v) : [...(f[k] || []), v]);
   function doParse() { const p = parseResume(f.resumeText); setF((x) => ({ ...x, ...p })); setParsed(true); setSaved(false); setDirty(true); }
   function parseTranscript() { const t = (f.transcriptText || "").toLowerCase(); const found = COURSE_DICT.filter((c) => t.includes(c)); if (found.length) setF((x) => ({ ...x, coursework: Array.from(new Set([...(x.coursework || []), ...found])) })); setSaved(false); setDirty(true); }
   function addProj() { const v = projDraft.trim(); if (v && !(f.projects || []).includes(v)) setF((x) => ({ ...x, projects: [...(x.projects || []), v] })); setProjDraft(""); setSaved(false); setDirty(true); }
-  function doSave() { onSave({ name: "You", location: f.location, remoteOk: f.remoteOk, years: f.years || 4, reputation: f.reputation || 42, skills: f.skills, coursework: f.coursework, certifications: f.certifications, hoursPerWeek: f.hoursPerWeek, days: f.days, times: f.times, slots: [...f.slots], radius: f.radius, locations: f.locations, anyLocation: f.anyLocation, linkedin: f.linkedin, projects: f.projects, transcriptText: f.transcriptText, transcriptName: f.transcriptName, categories: f.categories, wants: f.wants }); setSaved(true); setDirty(false); }
+  function doSave() { onSave({ name: "You", location: f.location, remoteOk: f.remoteOk, years: f.years || 4, reputation: f.reputation || 42, skills: f.skills, coursework: f.coursework, certifications: f.certifications, hoursPerWeek: f.hoursPerWeek, days: f.days, times: f.times, slots: [...f.slots], radius: f.radius, locations: f.locations, anyLocation: f.anyLocation, linkedin: f.linkedin, projects: f.projects, transcriptText: f.transcriptText, transcriptName: f.transcriptName, categories: f.categories, wants: f.wants, resumeText: f.resumeText }); setSaved(true); setDirty(false); }
   return (
     <div className="prof">
       <div className="prof-head">
@@ -1048,9 +1126,10 @@ function ProfilePage({ profile, onSave, onQuiz }) {
           <textarea className="ta" value={f.resumeText} onChange={(e) => set("resumeText", e.target.value)} />
           <div className="inline" style={{ marginTop: 10, flexWrap: "wrap" }}>
             <button className="btn" onClick={doParse}><Sparkles size={14} /> Parse resume</button>
-            <label className="btn-ghost" style={{ cursor: "pointer" }}><FileUp size={14} /> Upload PDF<input type="file" accept=".pdf" style={{ display: "none" }} onChange={(e) => { const x = e.target.files?.[0]; if (x) set("fileName", x.name); e.target.value = ""; }} /></label>
+            <label className={`btn-ghost ${pdfBusy ? "disabled" : ""}`} style={{ cursor: pdfBusy ? "default" : "pointer" }}><FileUp size={14} /> {pdfBusy ? "Reading…" : "Upload PDF"}<input type="file" accept=".pdf" disabled={pdfBusy} style={{ display: "none" }} onChange={(e) => { const x = e.target.files?.[0]; onResumePdf(x); e.target.value = ""; }} /></label>
           </div>
-          {f.fileName && <div className="note">Resume: {f.fileName}</div>}
+          {pdfErr && <div className="note err">{pdfErr}</div>}
+          {f.fileName && !pdfErr && <div className="note">Resume: {f.fileName}{pdfBusy ? " · extracting text…" : " · text extracted ✓"}</div>}
 
           <div className="lbl">Transcript</div>
           <textarea className="ta" style={{ minHeight: 110 }} placeholder="Paste your transcript — courses, grades…" value={f.transcriptText} onChange={(e) => set("transcriptText", e.target.value)} />
@@ -1246,6 +1325,36 @@ const STYLE = `
 .tm-wallet-note.warn{ color:#ff8a72; }
 .tm-wallet-connect{ display:flex; align-items:center; justify-content:center; gap:7px; width:100%; margin-top:12px; padding:10px; border-radius:9px; border:1px dashed #2b5141; background:transparent; color:var(--em); font-size:12.5px; font-weight:700; cursor:pointer; }
 .tm-wallet-connect:hover{ background:#0f2419; }
+.ab-score{ margin-left:12px; display:inline-flex; align-items:center; gap:6px; font-family:'JetBrains Mono',monospace; font-size:11px; font-weight:700; letter-spacing:.5px; padding:7px 11px; border-radius:9px; border:1px solid #6b4ea8; background:linear-gradient(180deg,#2a2150,#1c1838); color:#cbb6ff; cursor:pointer; flex:none; }
+.ab-score:hover:not(:disabled){ border-color:#8a6fd0; color:#e2d6ff; }
+.ab-score:disabled{ opacity:.5; cursor:default; }
+.ab-score.active{ animation:abpulse 1.4s ease-in-out infinite; }
+.tc-mp.ai{ display:inline-flex; align-items:center; gap:3px; background:linear-gradient(180deg,rgba(108,79,168,.92),rgba(70,52,120,.92)); color:#e2d6ff; }
+.tc-ai{ display:flex; align-items:flex-start; gap:5px; margin:8px 0 2px; font-size:11.5px; line-height:1.35; color:#cbb6ff; font-style:italic; }
+.tc-ai svg{ flex:none; margin-top:2px; }
+.tm-match.ai{ display:inline-flex; align-items:center; gap:4px; background:linear-gradient(180deg,#6c4fa8,#46347a); color:#f0e9ff; text-transform:capitalize; }
+.tm-match-panel{ background:linear-gradient(180deg,rgba(108,79,168,.10),rgba(108,79,168,.04)); border:1px solid #3a2f63; border-radius:12px; padding:14px 16px; }
+.tm-match-panel h4{ display:flex; align-items:center; gap:6px; color:#cbb6ff; }
+.tm-rationale{ color:var(--txt); font-size:13.5px; line-height:1.5; margin:6px 0 0; }
+.tm-fit{ display:flex; flex-wrap:wrap; gap:18px; margin-top:12px; }
+.tm-fit-col{ flex:1; min-width:160px; }
+.tm-fit-lbl{ display:inline-flex; align-items:center; gap:5px; font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:.5px; margin-bottom:7px; }
+.tm-fit-lbl.have{ color:var(--em); }
+.tm-fit-lbl.need{ color:#ff8a72; }
+.tm-skill.have{ border-color:#1e5a3d; color:#9fe7c4; }
+.tm-skill.need{ border-color:#5a3a30; color:#ffb29c; }
+.tm-procon{ display:flex; flex-wrap:wrap; gap:18px; margin-top:14px; }
+.tm-pros,.tm-cons{ flex:1; min-width:160px; list-style:none; padding:0; margin:0; display:flex; flex-direction:column; gap:6px; }
+.tm-pros li,.tm-cons li{ display:flex; align-items:flex-start; gap:6px; font-size:12.5px; line-height:1.4; color:var(--mut); }
+.tm-pros li svg{ color:var(--em); flex:none; margin-top:2px; }
+.tm-cons li svg{ color:#ff8a72; flex:none; margin-top:2px; }
+.sc-hint{ color:var(--mut); font-size:12px; line-height:1.5; margin:4px 2px 0; }
+.note.err{ color:#ff8a72; }
+.sortrow{ display:flex; align-items:center; gap:7px; flex-wrap:wrap; margin-top:10px; }
+.sort-lbl{ font-family:'JetBrains Mono',monospace; font-size:11px; text-transform:uppercase; letter-spacing:.5px; color:var(--mut); }
+.sort-chip{ font-size:12px; font-weight:600; padding:5px 11px; border-radius:999px; border:1px solid var(--line); background:transparent; color:var(--mut); cursor:pointer; }
+.sort-chip:hover{ color:var(--txt); border-color:#2b5141; }
+.sort-chip.on{ background:var(--em); color:#06100b; border-color:var(--em); }
 .fgroup-pay{ gap:16px; }
 .pay-val{ font-family:'JetBrains Mono',monospace; font-size:13px; color:var(--em); min-width:120px; text-align:right; flex:none; }
 .ab-gear{ margin-left:16px; width:34px; height:34px; border-radius:9px; background:transparent; border:1px solid var(--line); color:var(--mut); display:grid; place-items:center; cursor:pointer; flex:none; }
@@ -1733,7 +1842,7 @@ const QUIZ_CSS = `
 function Toggle({ on, onChange }) {
   return <button className={`tgl ${on ? "on" : ""}`} onClick={() => onChange(!on)} role="switch" aria-checked={on}><span className="tgl-knob" /></button>;
 }
-function SettingsPage({ profile }) {
+function SettingsPage({ profile, aiKey, onAiKey }) {
   const [notif, setNotif] = useState({ matches: true, expiring: true, paid: true, digest: false });
   const [privacy, setPrivacy] = useState({ visible: true, showLoc: true });
   const [autoWithdraw, setAutoWithdraw] = useState(false);
@@ -1752,6 +1861,15 @@ function SettingsPage({ profile }) {
         <div className="sc-row"><div><b>Connected wallet</b><span>0x8F3a…D71c · Base</span></div><button className="btn-ghost sm">Disconnect</button></div>
         <div className="sc-field"><label>Display name</label><input value={name} onChange={(e) => setName(e.target.value)} placeholder="How agents see you" /></div>
         <div className="sc-field"><label>Email for alerts</label><input value={email} onChange={(e) => setEmail(e.target.value)} placeholder="you@email.com" type="email" /></div>
+      </section>
+
+      <section className="sc">
+        <div className="sc-head"><Sparkles size={16} /> AI matching (Claude)</div>
+        <div className="sc-field">
+          <label>Anthropic API key</label>
+          <input type="password" value={aiKey || ""} onChange={(e) => onAiKey(e.target.value.trim())} placeholder="sk-ant-…" autoComplete="off" spellCheck={false} />
+        </div>
+        <p className="sc-hint">{aiKey ? "Key set — use “Score with Claude” to rank the board against your profile." : "Add your key to score gigs with Claude and see a per-task rationale. Stored only in this browser; sent only to Anthropic."}</p>
       </section>
 
       <section className="sc">
@@ -1792,13 +1910,27 @@ const TABS = [["suggested", "Suggested"], ["all", "All available"], ["working", 
 export default function McMatcherProduct() {
   const [screen, setScreen] = useState("landing");
   const [tab, setTab] = useState("suggested");
-  const [profile, setProfile] = useState(null);
-  const [applied, setApplied] = useState(["t1", "t3"]);
-  const [jobStatus, setJobStatus] = useState({ t1: "in_progress", t3: "submitted" });
+  // Profile + applications persist to localStorage so a refresh doesn't wipe
+  // them. Demo seeds (t1/t3) are the first-run default only.
+  const [profile, setProfile] = useState(() => load(LS.profile, null));
+  const [applied, setApplied] = useState(() => load(LS_APPLIED, ["t1", "t3"]));
+  const [jobStatus, setJobStatus] = useState(() => load(LS_JOBSTATUS, { t1: "in_progress", t3: "submitted" }));
   // Live McClaw tasks: applying is an on-chain $MCLAW stake the user signs on
   // mcclaw.io — we can't do it for them. `staked[id]` flips true once the user
   // confirms they've completed that hand-off. Demo tasks skip this entirely.
-  const [staked, setStaked] = useState({});
+  const [staked, setStaked] = useState(() => load(LS_STAKED, {}));
+  useEffect(() => save(LS.profile, profile), [profile]);
+  useEffect(() => save(LS_APPLIED, applied), [applied]);
+  useEffect(() => save(LS_JOBSTATUS, jobStatus), [jobStatus]);
+  useEffect(() => save(LS_STAKED, staked), [staked]);
+  // AI matching: real Claude scores keyed by task id. Needs an Anthropic key
+  // (from Settings or VITE_ANTHROPIC_API_KEY). Scores persist so we don't re-pay.
+  const [aiKey, setAiKey] = useState(() => load(LS.anthropicKey, "") || ENV_ANTHROPIC_KEY);
+  const [aiScores, setAiScores] = useState(() => load(LS_AISCORES, {}));
+  const [scoring, setScoring] = useState({ active: false, done: 0, total: 0 });
+  const scoreAbort = useRef(null);
+  useEffect(() => save(LS.anthropicKey, aiKey), [aiKey]);
+  useEffect(() => save(LS_AISCORES, aiScores), [aiScores]);
   const [tasks, setTasks] = useState(TASKS);
   const [live, setLive] = useState(false);
   const [loadingLive, setLoadingLive] = useState(true);
@@ -1813,7 +1945,13 @@ export default function McMatcherProduct() {
         if (!alive) return;
         if (list && list.length) {
           setTasks(list); setLive(true);
-          setApplied([]); setJobStatus({}); setStaked({}); // sample demo state doesn't apply to live tasks
+          // Keep any persisted applications that exist in the live board; drop
+          // demo seeds (t1/t3) and stale ids that are no longer on the board.
+          const liveIds = new Set(list.map((t) => t.id));
+          const keep = (obj) => Object.fromEntries(Object.entries(obj).filter(([id]) => liveIds.has(id)));
+          setApplied((a) => a.filter((id) => liveIds.has(id)));
+          setJobStatus((s) => keep(s));
+          setStaked((s) => keep(s));
         } else {
           setLive(false); setLiveError("empty"); // no key / empty board → demo data
         }
@@ -1852,6 +1990,40 @@ export default function McMatcherProduct() {
     setStaked((s) => { const n = { ...s }; delete n[id]; return n; });
   };
   const advance = (id, next) => setJobStatus((s) => ({ ...s, [id]: next }));
+
+  // --- AI scoring with Claude -----------------------------------------------
+  // Score the current board against the candidate, streaming each result in as
+  // it lands. Caps at MAX_LLM_JOBS so a huge board doesn't fan out unbounded.
+  const runScoring = React.useCallback(async () => {
+    if (!aiKey || !profile || scoring.active) return;
+    const jobs = tasks
+      .filter((t) => !isRefuse(t))
+      .slice(0, MAX_LLM_JOBS)
+      .map((t) => ({ ...t, description: t.desc, payNet: t.payout }));
+    if (!jobs.length) return;
+    scoreAbort.current?.abort();
+    const ctrl = new AbortController();
+    scoreAbort.current = ctrl;
+    setScoring({ active: true, done: 0, total: jobs.length });
+    try {
+      await scoreJobs(
+        aiKey,
+        DEFAULT_MODEL,
+        { profile, resumeText: profile.resumeText || "", jobs },
+        {
+          signal: ctrl.signal,
+          onResult: (_i, result, job) => { if (result?.llm) setAiScores((prev) => ({ ...prev, [job.id]: result.llm })); },
+          onProgress: (done, total) => setScoring((s) => ({ ...s, done, total })),
+        },
+      );
+    } catch (e) {
+      if (!ctrl.signal.aborted) console.warn("Claude scoring failed:", e?.message || e);
+    } finally {
+      if (scoreAbort.current === ctrl) setScoring((s) => ({ ...s, active: false }));
+    }
+  }, [aiKey, profile, tasks, scoring.active]);
+  useEffect(() => () => scoreAbort.current?.abort(), []);
+
   const activeCount = applied.filter((id) => !["paid", "closed", "rejected", "approved"].includes(jobKeyFor(tasks.find((x) => x.id === id), jobStatus))).length;
   const enter = (t) => { setTab(t); setScreen("app"); };
   const finishQuiz = (p) => { setProfile(p); enter("suggested"); };
@@ -1879,17 +2051,24 @@ export default function McMatcherProduct() {
               onClick={() => !loadingLive && loadLive()}>
               <span className="ab-dot" />{live ? `LIVE · ${tasks.length}` : loadingLive ? "CONNECTING…" : "DEMO · RETRY"}
             </button>
+            <button
+              className={`ab-score ${scoring.active ? "active" : ""}`}
+              disabled={scoring.active || !profile || !aiKey}
+              title={!aiKey ? "Add your Anthropic API key in Settings to score with Claude" : !profile ? "Set up your profile first" : "Score the board against your profile with Claude"}
+              onClick={runScoring}>
+              <Sparkles size={14} />{scoring.active ? `SCORING ${scoring.done}/${scoring.total}` : "SCORE WITH CLAUDE"}
+            </button>
             <div className="ab-prof">{profile ? `${profile.location} · ${profile.hoursPerWeek}h/wk · rep ${profile.reputation}` : "no profile"}</div>
             <WalletButton />
             <button className={`ab-gear ${tab === "settings" ? "on" : ""}`} title="Settings" onClick={() => setTab("settings")}><Settings size={17} /></button>
           </header>
           <main className="page">
-            {tab === "suggested" && <><h1 className="page-h">Suggested for you</h1><Suggested tasks={tasks} profile={profile} applied={applied} onApply={onApply} onUnapply={onUnapply} staked={staked} onConfirmStake={onConfirmStake} goProfile={() => setTab("profile")} onQuiz={() => setScreen("quiz")} /></>}
-            {tab === "all" && <><h1 className="page-h">All available</h1><AllAvailable tasks={tasks} profile={profile} applied={applied} onApply={onApply} onUnapply={onUnapply} staked={staked} onConfirmStake={onConfirmStake} /></>}
+            {tab === "suggested" && <><h1 className="page-h">Suggested for you</h1><Suggested tasks={tasks} profile={profile} applied={applied} onApply={onApply} onUnapply={onUnapply} staked={staked} onConfirmStake={onConfirmStake} aiScores={aiScores} goProfile={() => setTab("profile")} onQuiz={() => setScreen("quiz")} /></>}
+            {tab === "all" && <><h1 className="page-h">All available</h1><AllAvailable tasks={tasks} profile={profile} applied={applied} onApply={onApply} onUnapply={onUnapply} staked={staked} onConfirmStake={onConfirmStake} aiScores={aiScores} /></>}
             {tab === "working" && <><h1 className="page-h">Working on</h1><WorkingOn tasks={tasks} applied={applied} jobStatus={jobStatus} onAdvance={advance} /></>}
-            {tab === "applied" && <><h1 className="page-h">Applied</h1><Applied tasks={tasks} applied={applied} profile={profile} jobStatus={jobStatus} staked={staked} onConfirmStake={onConfirmStake} onUnapply={onUnapply} /></>}
+            {tab === "applied" && <><h1 className="page-h">Applied</h1><Applied tasks={tasks} applied={applied} profile={profile} jobStatus={jobStatus} staked={staked} onConfirmStake={onConfirmStake} onUnapply={onUnapply} aiScores={aiScores} /></>}
             {tab === "profile" && <ProfilePage profile={profile} onSave={setProfile} onQuiz={() => setScreen("quiz")} />}
-            {tab === "settings" && <SettingsPage profile={profile} />}
+            {tab === "settings" && <SettingsPage profile={profile} aiKey={aiKey} onAiKey={setAiKey} />}
           </main>
         </>
       )}
